@@ -1,0 +1,20 @@
+[package]
+name = "fela"
+version = "0.1.0"
+edition = "2021"
+authors = ["Chris Down <chris@chrisdown.name>"]
+description = "A fast, keyboard-driven image viewer."
+repository = "https://github.com/cdown/fela"
+keywords = ["image", "viewer", "raw", "arw", "nsxiv"]
+categories = ["multimedia::images"]
+license = "MIT"
+rust-version = "1.87"
+
+[dependencies]
+anyhow = { version = "1.0.104", features = ["std"], default-features = false }
+clap = { version = "4.6.7", features = ["std", "derive", "help"], default-features = false }
+fast_image_resize = { version = "6.1.0", features = ["std"], default-features = false }
+png = { version = "0.18.1", default-features = false }
+softbuffer = { version = "0.4.8", features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"], default-features = false }
+winit = { version = "0.30.13", features = ["rwh_06", "x11", "wayland", "wayland-dlopen"], default-features = false }
+zune-jpeg = { version = "0.5.15", features = ["std", "x86"], default-features = false }
