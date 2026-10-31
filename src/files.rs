@@ -91,6 +91,21 @@ impl FileList {
         self.list.len()
     }
 
+    pub fn index(&self) -> usize {
+        self.cur
+    }
+
+    pub fn get(&self, idx: usize) -> Option<&PathBuf> {
+        self.list.get(idx)
+    }
+
+    pub fn position(&self, hint: usize, path: &Path) -> Option<usize> {
+        if self.get(hint).is_some_and(|p| p == path) {
+            return Some(hint);
+        }
+        self.list.iter().position(|p| p == path)
+    }
+
     pub fn current(&self) -> Option<&PathBuf> {
         self.list.get(self.cur)
     }

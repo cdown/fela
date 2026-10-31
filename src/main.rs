@@ -2,8 +2,10 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use softbuffer::Surface;
 use std::num::NonZeroU32;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
@@ -11,11 +13,14 @@ use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
+mod cache;
+mod config;
 mod decode;
 mod files;
+mod loader;
 mod view;
 
-const JUMP: isize = 10;
+const WINDOW_SIZE: PhysicalSize<u32> = PhysicalSize::new(800, 600);
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -32,27 +37,29 @@ struct Args {
 
 enum ViewerEvent {
     Listed(Vec<PathBuf>),
+    Loaded(loader::LoadResult),
 }
 
 struct Viewer {
+    cfg: config::Config,
     files: files::FileList,
-    img: Option<decode::DecodedImage>,
-    frame: Option<decode::RenderedImage>,
+    cache: cache::ImageCache,
+    loader: loader::Loader,
+    size: PhysicalSize<u32>,
+    /// How far the last navigation moved, as a hint for where the next one will go.
+    last_step: isize,
+    shown: Option<Arc<decode::RenderedImage>>,
     count: Option<usize>,
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
     err: Option<anyhow::Error>,
 }
 
-fn read_image(path: &Path) -> Result<decode::DecodedImage> {
-    decode::decode(&std::fs::read(path)?)
-}
-
 impl Viewer {
     fn init_window(&mut self, el: &ActiveEventLoop) -> Result<()> {
         let attrs = Window::default_attributes()
             .with_title("fela")
-            .with_inner_size(PhysicalSize::new(800, 600));
+            .with_inner_size(WINDOW_SIZE);
         let window = Rc::new(el.create_window(attrs)?);
         let ctx = softbuffer::Context::new(window.clone()).map_err(|err| anyhow!("{err}"))?;
         self.surface = Some(Surface::new(&ctx, window.clone()).map_err(|err| anyhow!("{err}"))?);
@@ -60,16 +67,58 @@ impl Viewer {
         Ok(())
     }
 
-    fn load_current(&mut self) {
-        self.frame = None;
-        self.img = self.files.current().and_then(|path| {
-            read_image(path)
-                .inspect_err(|err| eprintln!("{}: {err:#}", path.display()))
-                .ok()
-        });
+    fn request_redraw(&self) {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
+    }
+
+    fn job_for(&self, idx: usize, spec: loader::Spec) -> Option<loader::LoadJob> {
+        let full = match self.cache.get(idx) {
+            Some(entry) if entry.spec == spec || entry.result.is_err() => return None,
+            Some(entry) => entry
+                .result
+                .as_ref()
+                .ok()
+                .and_then(|ready| ready.full.clone()),
+            None => None,
+        };
+        Some(loader::LoadJob {
+            idx,
+            path: self.files.get(idx)?.clone(),
+            spec,
+            full,
+        })
+    }
+
+    fn schedule(&mut self) {
+        let spec = loader::Spec {
+            w: self.size.width,
+            h: self.size.height,
+            upscale: false,
+        };
+        let cur = self.files.index();
+        let dir = if self.last_step < 0 { -1 } else { 1 };
+        let nr_ahead = isize::try_from(self.cfg.prefetch_ahead).unwrap_or(isize::MAX);
+        let nr_behind = isize::try_from(self.cfg.prefetch_behind).unwrap_or(isize::MAX);
+
+        let mut steps = Vec::new();
+        if self.cfg.prefetch_jump && self.last_step.abs() > 1 {
+            steps.push(self.last_step);
+        }
+        steps.extend((1..=nr_ahead).map(|nr| nr * dir));
+        steps.extend((1..=nr_behind).map(|nr| -nr * dir));
+
+        let mut prefetch: Vec<loader::LoadJob> = Vec::new();
+        for step in steps {
+            let Some(idx) = cur.checked_add_signed(step) else {
+                continue;
+            };
+            if prefetch.iter().all(|job| job.idx != idx) {
+                prefetch.extend(self.job_for(idx, spec));
+            }
+        }
+        self.loader.set_jobs(self.job_for(cur, spec), prefetch);
     }
 
     fn redraw(&mut self) -> Result<()> {
@@ -81,25 +130,36 @@ impl Viewer {
             return Ok(());
         };
 
-        let stale = self.frame.as_ref().is_none_or(|f| {
-            f.w > size.width || f.h > size.height || (f.w < size.width && f.h < size.height)
-        });
-        if let (true, Some(img)) = (stale, &self.img) {
-            self.frame = Some(decode::fit(img, size.width, size.height, false)?);
+        match self
+            .cache
+            .get(self.files.index())
+            .map(|entry| &entry.result)
+        {
+            Some(Ok(ready)) => self.shown = Some(Arc::clone(&ready.fit)),
+            Some(Err(_)) => self.shown = None,
+            None => {}
         }
 
         surface.resize(w, h).map_err(|err| anyhow!("{err}"))?;
         let mut buf = surface.buffer_mut().map_err(|err| anyhow!("{err}"))?;
-        match &self.frame {
+        match &self.shown {
             Some(frame) => view::draw(&mut buf, size.width as usize, size.height as usize, frame),
             None => buf.fill(0),
         }
-        buf.present().map_err(|err| anyhow!("{err}"))
+        buf.present().map_err(|err| anyhow!("{err}"))?;
+
+        if size != self.size {
+            self.size = size;
+            self.schedule();
+        }
+        Ok(())
     }
 
     fn on_key(&mut self, el: &ActiveEventLoop, key: &Key) {
         let count = self.count.take();
         let n = isize::try_from(count.unwrap_or(1)).unwrap_or(isize::MAX);
+        let jump = isize::try_from(self.cfg.jump).unwrap_or(isize::MAX);
+        let from = self.files.index();
         let last = self.files.len().saturating_sub(1);
 
         let moved = match key.as_ref() {
@@ -109,8 +169,8 @@ impl Viewer {
             }
             Key::Character("n") | Key::Named(NamedKey::Space) => self.files.step(n),
             Key::Character("p") | Key::Named(NamedKey::Backspace) => self.files.step(-n),
-            Key::Character("]") => self.files.step(n.saturating_mul(JUMP)),
-            Key::Character("[") => self.files.step(n.saturating_mul(-JUMP)),
+            Key::Character("]") => self.files.step(n.saturating_mul(jump)),
+            Key::Character("[") => self.files.step(n.saturating_mul(jump).saturating_neg()),
             Key::Character("g") => self.files.go_to(0),
             Key::Character("G") => self
                 .files
@@ -125,7 +185,27 @@ impl Viewer {
             _ => false,
         };
         if moved {
-            self.load_current();
+            let to = self.files.index();
+            self.last_step = if to > from {
+                isize::try_from(to - from).unwrap_or(isize::MAX)
+            } else {
+                isize::try_from(from - to).map_or(isize::MIN, |step| -step)
+            };
+            self.schedule();
+            self.request_redraw();
+        }
+    }
+
+    fn on_loaded(&mut self, loaded: loader::LoadResult) {
+        let Some(idx) = self.files.position(loaded.job.idx, &loaded.job.path) else {
+            return;
+        };
+        let cur = self.files.index();
+        self.cache.insert(idx, loaded);
+        self.cache.trim(cur);
+        self.schedule();
+        if idx == cur {
+            self.request_redraw();
         }
     }
 
@@ -139,10 +219,15 @@ impl Viewer {
 
 impl ApplicationHandler<ViewerEvent> for Viewer {
     fn resumed(&mut self, el: &ActiveEventLoop) {
-        if self.window.is_none() {
-            let res = self.init_window(el);
-            self.exit_on_err(el, res);
+        if self.window.is_some() {
+            return;
         }
+        // Creating a window takes a while, so get the first image going
+        self.size = WINDOW_SIZE;
+        self.schedule();
+
+        let res = self.init_window(el);
+        self.exit_on_err(el, res);
     }
 
     fn user_event(&mut self, el: &ActiveEventLoop, event: ViewerEvent) {
@@ -151,12 +236,12 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
                 self.exit_on_err(el, Err(anyhow!("no images to show")));
             }
             ViewerEvent::Listed(list) => {
-                let shown = self.files.current().cloned();
                 self.files.set_list(list);
-                if self.files.current() != shown.as_ref() {
-                    self.load_current();
-                }
+                self.cache.reindex(|path| self.files.position(0, path));
+                self.schedule();
+                self.request_redraw();
             }
+            ViewerEvent::Loaded(loaded) => self.on_loaded(loaded),
         }
     }
 
@@ -166,6 +251,7 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
             WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
                 self.on_key(el, &event.logical_key);
             }
+            WindowEvent::Resized(_) => self.request_redraw(),
             WindowEvent::RedrawRequested => {
                 let res = self.redraw();
                 self.exit_on_err(el, res);
@@ -175,8 +261,11 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
     }
 }
 
-fn spawn_lister(args: Vec<PathBuf>, proxy: EventLoopProxy<ViewerEvent>) {
+/// On slow storage listing a large directory would compete with reading the first image, so it
+/// waits until `gate` says that is done.
+fn spawn_lister(args: Vec<PathBuf>, gate: Receiver<()>, proxy: EventLoopProxy<ViewerEvent>) {
     std::thread::spawn(move || {
+        let _ = gate.recv();
         // Only fails if the event loop has gone away, in which case nobody wants the list anyway
         let _ = proxy.send_event(ViewerEvent::Listed(files::expand_args(&args)));
     });
@@ -184,6 +273,7 @@ fn spawn_lister(args: Vec<PathBuf>, proxy: EventLoopProxy<ViewerEvent>) {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let cfg = config::load()?;
     let mut paths = args.paths;
     if args.stdin {
         for line in std::io::stdin().lines() {
@@ -191,19 +281,25 @@ fn main() -> Result<()> {
         }
     }
 
+    let el = EventLoop::<ViewerEvent>::with_user_event().build()?;
+    let files = files::FileList::new(&paths);
+    let (gate_tx, gate_rx) = mpsc::channel();
+    let gate_tx = files.current().is_some().then_some(gate_tx);
+    spawn_lister(paths, gate_rx, el.create_proxy());
+
     let mut app = Viewer {
-        files: files::FileList::new(&paths),
-        img: None,
-        frame: None,
+        cache: cache::ImageCache::new(cfg.cache_mb),
+        loader: loader::Loader::new(cfg.prefetch_inflight, el.create_proxy(), gate_tx),
+        cfg,
+        files,
+        size: PhysicalSize::default(),
+        last_step: 1,
+        shown: None,
         count: None,
         window: None,
         surface: None,
         err: None,
     };
-    app.load_current();
-
-    let el = EventLoop::<ViewerEvent>::with_user_event().build()?;
-    spawn_lister(paths, el.create_proxy());
     el.run_app(&mut app)?;
     app.err.map_or(Ok(()), Err)
 }
