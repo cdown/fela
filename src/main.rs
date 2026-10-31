@@ -11,7 +11,7 @@ use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{Fullscreen, Window, WindowId};
 
 mod cache;
 mod config;
@@ -33,6 +33,9 @@ struct Args {
 
     #[arg(short = 'i', long, help = "Read paths from stdin, one per line")]
     stdin: bool,
+
+    #[arg(short, long, help = "Start in fullscreen")]
+    fullscreen: bool,
 }
 
 enum ViewerEvent {
@@ -41,6 +44,7 @@ enum ViewerEvent {
 }
 
 struct Viewer {
+    args: Args,
     cfg: config::Config,
     files: files::FileList,
     cache: cache::ImageCache,
@@ -59,7 +63,8 @@ impl Viewer {
     fn init_window(&mut self, el: &ActiveEventLoop) -> Result<()> {
         let attrs = Window::default_attributes()
             .with_title("fela")
-            .with_inner_size(WINDOW_SIZE);
+            .with_inner_size(WINDOW_SIZE)
+            .with_fullscreen(self.args.fullscreen.then_some(Fullscreen::Borderless(None)));
         let window = Rc::new(el.create_window(attrs)?);
         let ctx = softbuffer::Context::new(window.clone()).map_err(|err| anyhow!("{err}"))?;
         self.surface = Some(Surface::new(&ctx, window.clone()).map_err(|err| anyhow!("{err}"))?);
@@ -70,6 +75,13 @@ impl Viewer {
     fn request_redraw(&self) {
         if let Some(window) = &self.window {
             window.request_redraw();
+        }
+    }
+
+    fn toggle_fullscreen(&self) {
+        if let Some(window) = &self.window {
+            let is_fullscreen = window.fullscreen().is_some();
+            window.set_fullscreen((!is_fullscreen).then_some(Fullscreen::Borderless(None)));
         }
     }
 
@@ -172,6 +184,10 @@ impl Viewer {
             Key::Character("]") => self.files.step(n.saturating_mul(jump)),
             Key::Character("[") => self.files.step(n.saturating_mul(jump).saturating_neg()),
             Key::Character("g") => self.files.go_to(0),
+            Key::Character("f") => {
+                self.toggle_fullscreen();
+                false
+            }
             Key::Character("G") => self
                 .files
                 .go_to(count.map_or(last, |c| c.saturating_sub(1))),
@@ -223,7 +239,13 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
             return;
         }
         // Creating a window takes a while, so get the first image going
-        self.size = WINDOW_SIZE;
+        let monitor = el
+            .primary_monitor()
+            .or_else(|| el.available_monitors().next());
+        self.size = match monitor {
+            Some(monitor) if self.args.fullscreen => monitor.size(),
+            _ => WINDOW_SIZE,
+        };
         self.schedule();
 
         let res = self.init_window(el);
@@ -272,9 +294,9 @@ fn spawn_lister(args: Vec<PathBuf>, gate: Receiver<()>, proxy: EventLoopProxy<Vi
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
     let cfg = config::load()?;
-    let mut paths = args.paths;
+    let mut paths = std::mem::take(&mut args.paths);
     if args.stdin {
         for line in std::io::stdin().lines() {
             paths.push(line.context("failed to read paths from stdin")?.into());
@@ -290,6 +312,7 @@ fn main() -> Result<()> {
     let mut app = Viewer {
         cache: cache::ImageCache::new(cfg.cache_mb),
         loader: loader::Loader::new(cfg.prefetch_inflight, el.create_proxy(), gate_tx),
+        args,
         cfg,
         files,
         size: PhysicalSize::default(),
