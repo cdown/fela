@@ -13,6 +13,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
+mod bar;
 mod cache;
 mod config;
 mod decode;
@@ -50,6 +51,7 @@ struct Viewer {
     cache: cache::ImageCache,
     loader: loader::Loader,
     size: PhysicalSize<u32>,
+    is_bar_shown: bool,
     /// How far the last navigation moved, as a hint for where the next one will go.
     last_step: isize,
     shown: Option<Arc<decode::RenderedImage>>,
@@ -78,6 +80,39 @@ impl Viewer {
         }
     }
 
+    fn bar_height(&self) -> usize {
+        if self.is_bar_shown {
+            bar::HEIGHT
+        } else {
+            0
+        }
+    }
+
+    fn status(&self) -> (String, String) {
+        let cur = self.files.index();
+        let left = self
+            .files
+            .current()
+            .map_or(String::new(), |path| path.display().to_string());
+        let state = if self.files.is_listing {
+            "listing "
+        } else if self.cache.get(cur).is_none() {
+            "loading "
+        } else {
+            ""
+        };
+        let nr = if self.files.len() == 0 { 0 } else { cur + 1 };
+        (left, format!("{state}{nr}/{}", self.files.len()))
+    }
+
+    fn refresh(&mut self) {
+        self.schedule();
+        if let (Some(window), Some(path)) = (&self.window, self.files.current()) {
+            window.set_title(&format!("fela - {}", path.display()));
+        }
+        self.request_redraw();
+    }
+
     fn toggle_fullscreen(&self) {
         if let Some(window) = &self.window {
             let is_fullscreen = window.fullscreen().is_some();
@@ -104,9 +139,10 @@ impl Viewer {
     }
 
     fn schedule(&mut self) {
+        let bar_h = u32::try_from(self.bar_height()).unwrap_or(u32::MAX);
         let spec = loader::Spec {
             w: self.size.width,
-            h: self.size.height,
+            h: self.size.height.saturating_sub(bar_h),
             upscale: false,
         };
         let cur = self.files.index();
@@ -134,37 +170,49 @@ impl Viewer {
     }
 
     fn redraw(&mut self) -> Result<()> {
-        let (Some(window), Some(surface)) = (&self.window, &mut self.surface) else {
+        let Some(window) = self.window.clone() else {
             return Ok(());
         };
         let size = window.inner_size();
         let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else {
             return Ok(());
         };
-
-        match self
-            .cache
-            .get(self.files.index())
-            .map(|entry| &entry.result)
-        {
-            Some(Ok(ready)) => self.shown = Some(Arc::clone(&ready.fit)),
-            Some(Err(_)) => self.shown = None,
-            None => {}
-        }
-
-        surface.resize(w, h).map_err(|err| anyhow!("{err}"))?;
-        let mut buf = surface.buffer_mut().map_err(|err| anyhow!("{err}"))?;
-        match &self.shown {
-            Some(frame) => view::draw(&mut buf, size.width as usize, size.height as usize, frame),
-            None => buf.fill(0),
-        }
-        buf.present().map_err(|err| anyhow!("{err}"))?;
-
         if size != self.size {
             self.size = size;
             self.schedule();
         }
-        Ok(())
+
+        let result = self
+            .cache
+            .get(self.files.index())
+            .map(|entry| &entry.result);
+        match result {
+            Some(Ok(ready)) => self.shown = Some(Arc::clone(&ready.fit)),
+            Some(Err(_)) => self.shown = None,
+            None => {}
+        }
+        let message = result.and_then(|result| result.as_ref().err());
+        let (left, right) = self.status();
+
+        let (buf_w, buf_h) = (size.width as usize, size.height as usize);
+        let bar_h = self.bar_height().min(buf_h);
+        let Some(surface) = &mut self.surface else {
+            return Ok(());
+        };
+        surface.resize(w, h).map_err(|err| anyhow!("{err}"))?;
+        let mut buf = surface.buffer_mut().map_err(|err| anyhow!("{err}"))?;
+        let (area, bar) = buf.split_at_mut((buf_h - bar_h) * buf_w);
+        match &self.shown {
+            Some(frame) => view::draw(area, buf_w, buf_h - bar_h, frame),
+            None => area.fill(0),
+        }
+        if let Some(message) = message {
+            bar::draw_message(area, buf_w, message);
+        }
+        if bar_h > 0 {
+            bar::draw(bar, buf_w, &left, &right);
+        }
+        buf.present().map_err(|err| anyhow!("{err}"))
     }
 
     fn on_key(&mut self, el: &ActiveEventLoop, key: &Key) {
@@ -184,6 +232,11 @@ impl Viewer {
             Key::Character("]") => self.files.step(n.saturating_mul(jump)),
             Key::Character("[") => self.files.step(n.saturating_mul(jump).saturating_neg()),
             Key::Character("g") => self.files.go_to(0),
+            Key::Character("b") => {
+                self.is_bar_shown = !self.is_bar_shown;
+                self.refresh();
+                false
+            }
             Key::Character("f") => {
                 self.toggle_fullscreen();
                 false
@@ -207,8 +260,7 @@ impl Viewer {
             } else {
                 isize::try_from(from - to).map_or(isize::MIN, |step| -step)
             };
-            self.schedule();
-            self.request_redraw();
+            self.refresh();
         }
     }
 
@@ -250,6 +302,7 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
 
         let res = self.init_window(el);
         self.exit_on_err(el, res);
+        self.refresh();
     }
 
     fn user_event(&mut self, el: &ActiveEventLoop, event: ViewerEvent) {
@@ -260,8 +313,7 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
             ViewerEvent::Listed(list) => {
                 self.files.set_list(list);
                 self.cache.reindex(|path| self.files.position(0, path));
-                self.schedule();
-                self.request_redraw();
+                self.refresh();
             }
             ViewerEvent::Loaded(loaded) => self.on_loaded(loaded),
         }
@@ -316,6 +368,7 @@ fn main() -> Result<()> {
         cfg,
         files,
         size: PhysicalSize::default(),
+        is_bar_shown: true,
         last_step: 1,
         shown: None,
         count: None,

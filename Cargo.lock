@@ -394,6 +394,7 @@ dependencies = [
  "anyhow",
  "clap",
  "fast_image_resize",
+ "font8x8",
  "png",
  "serde",
  "softbuffer",
@@ -418,6 +419,12 @@ dependencies = [
  "miniz_oxide 0.9.1",
  "zlib-rs",
 ]
+
+[[package]]
+name = "font8x8"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "875488b8711a968268c7cf5d139578713097ca4635a76044e8fe8eedf831d07e"
 
 [[package]]
 name = "foreign-types"
