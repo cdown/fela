@@ -19,6 +19,7 @@ mod config;
 mod decode;
 mod files;
 mod loader;
+mod tiff;
 mod view;
 
 const WINDOW_SIZE: PhysicalSize<u32> = PhysicalSize::new(800, 600);
@@ -96,7 +97,11 @@ impl Viewer {
             .map_or(String::new(), |path| path.display().to_string());
         let state = if self.files.is_listing {
             "listing "
-        } else if self.cache.get(cur).is_none() {
+        } else if self
+            .cache
+            .get(cur)
+            .is_none_or(cache::ImageCacheEntry::is_draft)
+        {
             "loading "
         } else {
             ""
@@ -122,12 +127,11 @@ impl Viewer {
 
     fn job_for(&self, idx: usize, spec: loader::Spec) -> Option<loader::LoadJob> {
         let full = match self.cache.get(idx) {
-            Some(entry) if entry.spec == spec || entry.result.is_err() => return None,
-            Some(entry) => entry
-                .result
-                .as_ref()
-                .ok()
-                .and_then(|ready| ready.full.clone()),
+            Some(entry) => match &entry.result {
+                Ok(ready) if entry.spec == spec && !ready.is_draft => return None,
+                Ok(ready) => ready.full.clone(),
+                Err(_) => return None,
+            },
             None => None,
         };
         Some(loader::LoadJob {

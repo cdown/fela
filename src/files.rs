@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-const IMAGE_EXTS: [&str; 3] = ["jpg", "jpeg", "png"];
+const IMAGE_EXTS: [&str; 4] = ["jpg", "jpeg", "png", "arw"];
 
 pub struct FileList {
     list: Vec<PathBuf>,

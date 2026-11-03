@@ -1,4 +1,5 @@
 use crate::decode::{self, DecodedImage, RenderedImage};
+use crate::tiff;
 use crate::ViewerEvent;
 use anyhow::{ensure, Result};
 use std::fs::File;
@@ -10,6 +11,9 @@ use winit::event_loop::EventLoopProxy;
 
 /// We check whether a read is still wanted between chunks.
 const CHUNK: usize = 1 << 20;
+
+/// Enough of a RAW to find the JPEGs embedded in it. On the A1 II the last IFD ends 145KB in.
+const HEAD_LEN: usize = 256 << 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Spec {
@@ -29,7 +33,8 @@ pub struct LoadJob {
 
 pub struct PreparedImage {
     pub fit: Arc<RenderedImage>,
-    pub full: Arc<DecodedImage>,
+    pub full: Option<Arc<DecodedImage>>,
+    pub is_draft: bool,
 }
 
 pub struct LoadResult {
@@ -185,15 +190,73 @@ impl SharedLoader {
         Ok(true)
     }
 
-    fn read(&self, path: &Path) -> Result<Option<Vec<u8>>> {
+    fn read_span(
+        &self,
+        path: &Path,
+        file: &mut File,
+        head: &[u8],
+        span: tiff::ByteRange,
+    ) -> Result<Option<Vec<u8>>> {
+        let nr_have = head.len().saturating_sub(span.offset).min(span.len);
+        let mut data = head
+            .get(span.offset..span.offset + nr_have)
+            .unwrap_or_default()
+            .to_vec();
+        let offset = u64::try_from(span.offset + nr_have)?;
+        let is_complete = self.read_range(path, file, offset, span.len - nr_have, &mut data)?;
+        Ok(is_complete.then_some(data))
+    }
+
+    fn send(&self, job: &LoadJob, result: Result<PreparedImage, String>) {
+        let loaded = LoadResult {
+            job: job.clone(),
+            result,
+        };
+        // Only fails if the event loop has gone away, in which case we are exiting
+        let _ = self.proxy.send_event(ViewerEvent::Loaded(loaded));
+    }
+
+    /// Decoding the full size JPEG is slow, but the smaller one is usually fast, so draft it
+    fn send_draft(&self, job: &LoadJob, data: &[u8], orientation: u16) {
+        let fit = decode::decode(data, Some(orientation))
+            .and_then(|img| decode::fit(&img, job.spec.w, job.spec.h, true));
+        if let Ok(fit) = fit {
+            let prepared = PreparedImage {
+                fit: Arc::new(fit),
+                full: None,
+                is_draft: true,
+            };
+            self.send(job, Ok(prepared));
+        }
+    }
+
+    fn read(&self, job: &LoadJob) -> Result<Option<(Vec<u8>, Option<u16>)>> {
+        let path = &job.path;
         if !self.wait_for_disk(path) {
             return Ok(None);
         }
         let mut file = File::open(path)?;
         let len = usize::try_from(file.metadata()?.len())?;
-        let mut data = Vec::new();
-        let is_complete = self.read_range(path, &mut file, 0, len, &mut data)?;
-        Ok(is_complete.then_some(data))
+        let mut head = Vec::new();
+        if !self.read_range(path, &mut file, 0, len.min(HEAD_LEN), &mut head)? {
+            return Ok(None);
+        }
+        if !tiff::has_tiff_magic(&head) {
+            let offset = u64::try_from(head.len())?;
+            let nr_left = len - head.len();
+            let is_complete = self.read_range(path, &mut file, offset, nr_left, &mut head)?;
+            return Ok(is_complete.then_some((head, None)));
+        }
+
+        let embedded = tiff::find_embedded(&head)?;
+        if let Some(draft) = embedded.draft {
+            let Some(data) = self.read_span(path, &mut file, &head, draft)? else {
+                return Ok(None);
+            };
+            self.send_draft(job, &data, embedded.orientation);
+        }
+        let data = self.read_span(path, &mut file, &head, embedded.full)?;
+        Ok(data.map(|data| (data, Some(embedded.orientation))))
     }
 
     /// None means the job was abandoned because it is no longer wanted.
@@ -201,18 +264,18 @@ impl SharedLoader {
         let full = match &job.full {
             Some(full) => Arc::clone(full),
             None => {
-                let data = self.read(&job.path);
+                let data = self.read(job);
                 self.lister_gate
                     .lock()
                     .expect("BUG: lister gate poisoned")
                     .take();
-                let Some(data) = data? else {
+                let Some((data, orientation)) = data? else {
                     return Ok(None);
                 };
                 if !self.start_decoding(&job.path) {
                     return Ok(None);
                 }
-                Arc::new(decode::decode(&data)?)
+                Arc::new(decode::decode(&data, orientation)?)
             }
         };
         let fit = Arc::new(decode::fit(
@@ -221,7 +284,11 @@ impl SharedLoader {
             job.spec.h,
             job.spec.upscale,
         )?);
-        Ok(Some(PreparedImage { fit, full }))
+        Ok(Some(PreparedImage {
+            fit,
+            full: Some(full),
+            is_draft: false,
+        }))
     }
 
     fn work(&self, is_reserved: bool) {
@@ -230,10 +297,7 @@ impl SharedLoader {
             let result = self.run(&job).map_err(|err| format!("{err:#}")).transpose();
             self.finish(&job.path, result.is_some());
             if let Some(result) = result {
-                // Only fails if the event loop has gone away, in which case we are exiting
-                let _ = self
-                    .proxy
-                    .send_event(ViewerEvent::Loaded(LoadResult { job, result }));
+                self.send(&job, result);
             }
         }
     }

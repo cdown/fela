@@ -8,6 +8,7 @@ use std::sync::Arc;
 pub struct CachedImage {
     pub fit: Arc<RenderedImage>,
     pub full: Option<Arc<DecodedImage>>,
+    pub is_draft: bool,
 }
 
 pub struct ImageCacheEntry {
@@ -17,6 +18,10 @@ pub struct ImageCacheEntry {
 }
 
 impl ImageCacheEntry {
+    pub fn is_draft(&self) -> bool {
+        self.result.as_ref().is_ok_and(|ready| ready.is_draft)
+    }
+
     fn size(&self) -> usize {
         self.result.as_ref().map_or(0, |ready| {
             ready.fit.px.len() * 4 + ready.full.as_ref().map_or(0, |full| full.px.len())
@@ -44,8 +49,16 @@ impl ImageCache {
     pub fn insert(&mut self, idx: usize, loaded: LoadResult) {
         let result = loaded.result.map(|prepared| CachedImage {
             fit: prepared.fit,
-            full: Some(prepared.full),
+            full: prepared.full,
+            is_draft: prepared.is_draft,
         });
+        let is_draft = result.as_ref().is_ok_and(|ready| ready.is_draft);
+        let has_real = self
+            .get(idx)
+            .is_some_and(|entry| entry.result.is_ok() && !entry.is_draft());
+        if is_draft && has_real {
+            return;
+        }
         let entry = ImageCacheEntry {
             path: loaded.job.path,
             spec: loaded.job.spec,
