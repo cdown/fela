@@ -22,6 +22,8 @@ mod loader;
 mod tiff;
 mod view;
 
+use view::{ScaleMode, ZoomStep};
+
 const WINDOW_SIZE: PhysicalSize<u32> = PhysicalSize::new(800, 600);
 
 #[derive(Parser, Debug)]
@@ -56,6 +58,7 @@ struct Viewer {
     /// How far the last navigation moved, as a hint for where the next one will go.
     last_step: isize,
     shown: Option<Arc<decode::RenderedImage>>,
+    view: view::View,
     count: Option<usize>,
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
@@ -89,6 +92,43 @@ impl Viewer {
         }
     }
 
+    fn area(&self) -> (u32, u32) {
+        let bar_h = u32::try_from(self.bar_height()).unwrap_or(u32::MAX);
+        (self.size.width, self.size.height.saturating_sub(bar_h))
+    }
+
+    fn zoom(&self) -> Option<f64> {
+        if let ScaleMode::Zoom(zoom) = self.view.scale {
+            return Some(zoom);
+        }
+        let entry = self.cache.get(self.files.index())?;
+        let ready = entry.result.as_ref().ok().filter(|ready| !ready.is_draft)?;
+        Some(f64::from(ready.fit.w) / f64::from(ready.size.0))
+    }
+
+    fn step_zoom(&mut self, step: ZoomStep) {
+        if let Some(zoom) = self.zoom() {
+            self.view.step_zoom(zoom, step);
+            self.refresh();
+        }
+    }
+
+    fn set_scale(&mut self, scale: ScaleMode) {
+        self.view.scale = scale;
+        self.refresh();
+    }
+
+    fn pan(&mut self, dir: (f64, f64), nr_px: Option<usize>) {
+        self.view.pan_by(dir, nr_px, self.area());
+        self.request_redraw();
+    }
+
+    fn rotate(&mut self, turns: u8) {
+        self.view.turns = (self.view.turns + turns) % 4;
+        self.view.pan = (0.0, 0.0);
+        self.refresh();
+    }
+
     fn status(&self) -> (String, String) {
         let cur = self.files.index();
         let left = self
@@ -106,8 +146,11 @@ impl Viewer {
         } else {
             ""
         };
+        let zoom = self
+            .zoom()
+            .map_or(String::new(), |zoom| format!("{:.0}% ", zoom * 100.0));
         let nr = if self.files.len() == 0 { 0 } else { cur + 1 };
-        (left, format!("{state}{nr}/{}", self.files.len()))
+        (left, format!("{state}{zoom}{nr}/{}", self.files.len()))
     }
 
     fn refresh(&mut self) {
@@ -125,14 +168,29 @@ impl Viewer {
         }
     }
 
-    fn job_for(&self, idx: usize, spec: loader::Spec) -> Option<loader::LoadJob> {
+    fn job_for(&self, idx: usize) -> Option<loader::LoadJob> {
+        let is_current = idx == self.files.index();
+        let (w, h) = self.area();
+        let spec = loader::Spec {
+            w,
+            h,
+            upscale: self.view.scale == ScaleMode::Fit,
+            turns: if is_current { self.view.turns } else { 0 },
+        };
+        let needs_full = is_current && matches!(self.view.scale, ScaleMode::Zoom(_));
+
         let full = match self.cache.get(idx) {
-            Some(entry) => match &entry.result {
-                Ok(ready) if entry.spec == spec && !ready.is_draft => return None,
-                Ok(ready) => ready.full.clone(),
-                Err(_) => return None,
-            },
             None => None,
+            Some(entry) => match &entry.result {
+                Err(_) => return None,
+                Ok(ready) => {
+                    let is_fitted = entry.spec == spec && !ready.is_draft;
+                    if is_fitted && (ready.full.is_some() || !needs_full) {
+                        return None;
+                    }
+                    ready.full.clone()
+                }
+            },
         };
         Some(loader::LoadJob {
             idx,
@@ -143,12 +201,6 @@ impl Viewer {
     }
 
     fn schedule(&mut self) {
-        let bar_h = u32::try_from(self.bar_height()).unwrap_or(u32::MAX);
-        let spec = loader::Spec {
-            w: self.size.width,
-            h: self.size.height.saturating_sub(bar_h),
-            upscale: false,
-        };
         let cur = self.files.index();
         let dir = if self.last_step < 0 { -1 } else { 1 };
         let nr_ahead = isize::try_from(self.cfg.prefetch_ahead).unwrap_or(isize::MAX);
@@ -167,10 +219,10 @@ impl Viewer {
                 continue;
             };
             if prefetch.iter().all(|job| job.idx != idx) {
-                prefetch.extend(self.job_for(idx, spec));
+                prefetch.extend(self.job_for(idx));
             }
         }
-        self.loader.set_jobs(self.job_for(cur, spec), prefetch);
+        self.loader.set_jobs(self.job_for(cur), prefetch);
     }
 
     fn redraw(&mut self) -> Result<()> {
@@ -186,16 +238,28 @@ impl Viewer {
             self.schedule();
         }
 
-        let result = self
+        let mut message = None;
+        match self
             .cache
             .get(self.files.index())
-            .map(|entry| &entry.result);
-        match result {
-            Some(Ok(ready)) => self.shown = Some(Arc::clone(&ready.fit)),
-            Some(Err(_)) => self.shown = None,
+            .map(|entry| &entry.result)
+        {
+            Some(Ok(ready)) => {
+                self.shown = Some(Arc::clone(&ready.fit));
+                if let (ScaleMode::Zoom(zoom), Some(full)) = (self.view.scale, &ready.full) {
+                    let img_size = full.upright_size(self.view.turns);
+                    let region = self.view.region(zoom, img_size, self.area());
+                    let turns = self.view.turns;
+                    let frame = decode::render(full, turns, region.crop, region.w, region.h)?;
+                    self.shown = Some(Arc::new(frame));
+                }
+            }
+            Some(Err(err)) => {
+                self.shown = None;
+                message = Some(err.clone());
+            }
             None => {}
         }
-        let message = result.and_then(|result| result.as_ref().err());
         let (left, right) = self.status();
 
         let (buf_w, buf_h) = (size.width as usize, size.height as usize);
@@ -210,7 +274,7 @@ impl Viewer {
             Some(frame) => view::draw(area, buf_w, buf_h - bar_h, frame),
             None => area.fill(0),
         }
-        if let Some(message) = message {
+        if let Some(message) = &message {
             bar::draw_message(area, buf_w, message);
         }
         if bar_h > 0 {
@@ -236,6 +300,50 @@ impl Viewer {
             Key::Character("]") => self.files.step(n.saturating_mul(jump)),
             Key::Character("[") => self.files.step(n.saturating_mul(jump).saturating_neg()),
             Key::Character("g") => self.files.go_to(0),
+            Key::Character("+") => {
+                self.step_zoom(ZoomStep::In);
+                false
+            }
+            Key::Character("-") => {
+                self.step_zoom(ZoomStep::Out);
+                false
+            }
+            Key::Character("=") => {
+                self.set_scale(ScaleMode::Zoom(count.map_or(1.0, |c| c as f64 / 100.0)));
+                false
+            }
+            Key::Character("w") => {
+                self.set_scale(ScaleMode::ShrinkToFit);
+                false
+            }
+            Key::Character("W") => {
+                self.set_scale(ScaleMode::Fit);
+                false
+            }
+            Key::Character("h") | Key::Named(NamedKey::ArrowLeft) => {
+                self.pan((-1.0, 0.0), count);
+                false
+            }
+            Key::Character("l") | Key::Named(NamedKey::ArrowRight) => {
+                self.pan((1.0, 0.0), count);
+                false
+            }
+            Key::Character("k") | Key::Named(NamedKey::ArrowUp) => {
+                self.pan((0.0, -1.0), count);
+                false
+            }
+            Key::Character("j") | Key::Named(NamedKey::ArrowDown) => {
+                self.pan((0.0, 1.0), count);
+                false
+            }
+            Key::Character("<") => {
+                self.rotate(3);
+                false
+            }
+            Key::Character(">") => {
+                self.rotate(1);
+                false
+            }
             Key::Character("b") => {
                 self.is_bar_shown = !self.is_bar_shown;
                 self.refresh();
@@ -264,6 +372,8 @@ impl Viewer {
             } else {
                 isize::try_from(from - to).map_or(isize::MIN, |step| -step)
             };
+            self.view.pan = (0.0, 0.0);
+            self.view.turns = 0;
             self.refresh();
         }
     }
@@ -375,6 +485,7 @@ fn main() -> Result<()> {
         is_bar_shown: true,
         last_step: 1,
         shown: None,
+        view: view::View::new(),
         count: None,
         window: None,
         surface: None,

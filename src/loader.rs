@@ -20,6 +20,7 @@ pub struct Spec {
     pub w: u32,
     pub h: u32,
     pub upscale: bool,
+    pub turns: u8,
 }
 
 #[derive(Clone)]
@@ -34,6 +35,7 @@ pub struct LoadJob {
 pub struct PreparedImage {
     pub fit: Arc<RenderedImage>,
     pub full: Option<Arc<DecodedImage>>,
+    pub size: (u32, u32),
     pub is_draft: bool,
 }
 
@@ -218,12 +220,15 @@ impl SharedLoader {
 
     /// Decoding the full size JPEG is slow, but the smaller one is usually fast, so draft it
     fn send_draft(&self, job: &LoadJob, data: &[u8], orientation: u16) {
-        let fit = decode::decode(data, Some(orientation))
-            .and_then(|img| decode::fit(&img, job.spec.w, job.spec.h, true));
-        if let Ok(fit) = fit {
+        let spec = job.spec;
+        let Ok(img) = decode::decode(data, Some(orientation)) else {
+            return;
+        };
+        if let Ok(fit) = decode::fit(&img, spec.w, spec.h, true, spec.turns) {
             let prepared = PreparedImage {
                 fit: Arc::new(fit),
                 full: None,
+                size: img.upright_size(spec.turns),
                 is_draft: true,
             };
             self.send(job, Ok(prepared));
@@ -278,14 +283,11 @@ impl SharedLoader {
                 Arc::new(decode::decode(&data, orientation)?)
             }
         };
-        let fit = Arc::new(decode::fit(
-            &full,
-            job.spec.w,
-            job.spec.h,
-            job.spec.upscale,
-        )?);
+        let spec = job.spec;
+        let fit = decode::fit(&full, spec.w, spec.h, spec.upscale, spec.turns)?;
         Ok(Some(PreparedImage {
-            fit,
+            fit: Arc::new(fit),
+            size: full.upright_size(spec.turns),
             full: Some(full),
             is_draft: false,
         }))

@@ -14,6 +14,28 @@ pub struct DecodedImage {
     pub turns: u8,
 }
 
+impl DecodedImage {
+    pub fn upright_size(&self, turns: u8) -> (u32, u32) {
+        if (self.turns + turns) % 2 == 1 {
+            (self.h, self.w)
+        } else {
+            (self.w, self.h)
+        }
+    }
+}
+
+// These all look suspiciously similar, but:
+//
+// - ImageRect is an area in upright image coordinates
+// - RenderedImage is the scaled, rotated 0RGB pixels ready to draw
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ImageRect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
 pub struct RenderedImage {
     pub w: u32,
     pub h: u32,
@@ -85,32 +107,65 @@ fn decode_png(data: &[u8]) -> Result<DecodedImage> {
     })
 }
 
-pub fn fit(img: &DecodedImage, box_w: u32, box_h: u32, upscale: bool) -> Result<RenderedImage> {
-    let (box_w, box_h) = if img.turns % 2 == 1 {
-        (box_h, box_w)
-    } else {
-        (box_w, box_h)
-    };
+pub fn fit(
+    img: &DecodedImage,
+    box_w: u32,
+    box_h: u32,
+    upscale: bool,
+    turns: u8,
+) -> Result<RenderedImage> {
+    let (w, h) = img.upright_size(turns);
     let mut scale = f64::min(
-        f64::from(box_w) / f64::from(img.w),
-        f64::from(box_h) / f64::from(img.h),
+        f64::from(box_w) / f64::from(w),
+        f64::from(box_h) / f64::from(h),
     );
     if !upscale {
         scale = scale.min(1.0);
     }
     let dim = |v: u32| ((f64::from(v) * scale).round() as u32).max(1);
-    Ok(rotate(scale_to(img, dim(img.w), dim(img.h))?, img.turns))
+    let crop = ImageRect {
+        x: 0.0,
+        y: 0.0,
+        w: f64::from(w),
+        h: f64::from(h),
+    };
+    render(img, turns, crop, dim(w), dim(h))
 }
 
-fn scale_to(img: &DecodedImage, w: u32, h: u32) -> Result<RenderedImage> {
+pub fn render(
+    img: &DecodedImage,
+    turns: u8,
+    crop: ImageRect,
+    w: u32,
+    h: u32,
+) -> Result<RenderedImage> {
+    let turns = (img.turns + turns) % 4;
+    let (img_w, img_h) = (f64::from(img.w), f64::from(img.h));
+    // The pixels we have are not rotated, so this needs translation
+    let (left, top, crop_w, crop_h) = match turns {
+        1 => (crop.y, img_h - crop.x - crop.w, crop.h, crop.w),
+        2 => (
+            img_w - crop.x - crop.w,
+            img_h - crop.y - crop.h,
+            crop.w,
+            crop.h,
+        ),
+        3 => (img_w - crop.y - crop.h, crop.x, crop.h, crop.w),
+        _ => (crop.x, crop.y, crop.w, crop.h),
+    };
+    let (left, top) = (left.clamp(0.0, img_w - 1.0), top.clamp(0.0, img_h - 1.0));
+    let (crop_w, crop_h) = (crop_w.min(img_w - left), crop_h.min(img_h - top));
+    let (w, h) = if turns % 2 == 1 { (h, w) } else { (w, h) };
+
     let src = fr::images::ImageRef::new(img.w, img.h, &img.px, fr::PixelType::U8x4)?;
     let mut dst = fr::images::Image::new(w, h, fr::PixelType::U8x4);
-    let filter = if w < img.w {
+    let filter = if f64::from(w) < crop_w {
         fr::FilterType::Box
     } else {
         fr::FilterType::Bilinear
     };
     let opts = fr::ResizeOptions::new()
+        .crop(left, top, crop_w, crop_h)
         .resize_alg(fr::ResizeAlg::Convolution(filter))
         .use_alpha(false);
     fr::Resizer::new().resize(&src, &mut dst, &opts)?;
@@ -120,7 +175,7 @@ fn scale_to(img: &DecodedImage, w: u32, h: u32) -> Result<RenderedImage> {
         .chunks_exact(4)
         .map(|p| u32::from(p[0]) << 16 | u32::from(p[1]) << 8 | u32::from(p[2]))
         .collect();
-    Ok(RenderedImage { w, h, px })
+    Ok(rotate(RenderedImage { w, h, px }, turns))
 }
 
 fn rotate(frame: RenderedImage, turns: u8) -> RenderedImage {

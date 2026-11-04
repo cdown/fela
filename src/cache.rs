@@ -8,6 +8,7 @@ use std::sync::Arc;
 pub struct CachedImage {
     pub fit: Arc<RenderedImage>,
     pub full: Option<Arc<DecodedImage>>,
+    pub size: (u32, u32),
     pub is_draft: bool,
 }
 
@@ -50,6 +51,7 @@ impl ImageCache {
         let result = loaded.result.map(|prepared| CachedImage {
             fit: prepared.fit,
             full: prepared.full,
+            size: prepared.size,
             is_draft: prepared.is_draft,
         });
         let is_draft = result.as_ref().is_ok_and(|ready| ready.is_draft);
