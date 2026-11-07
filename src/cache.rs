@@ -47,6 +47,10 @@ impl ImageCache {
         self.entries.get(&idx)
     }
 
+    pub fn remove(&mut self, idx: usize) {
+        self.entries.remove(&idx);
+    }
+
     pub fn insert(&mut self, idx: usize, loaded: LoadResult) {
         let result = loaded.result.map(|prepared| CachedImage {
             fit: prepared.fit,

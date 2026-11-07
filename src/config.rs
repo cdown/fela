@@ -17,6 +17,8 @@ pub struct Config {
     pub prefetch_inflight: usize,
     /// How much memory prepared images may use, in MiB.
     pub cache_mb: usize,
+    /// The key handler and its arguments.
+    pub handler: Vec<String>,
 }
 
 impl Default for Config {
@@ -28,6 +30,7 @@ impl Default for Config {
             prefetch_jump: true,
             prefetch_inflight: 2,
             cache_mb: 1024,
+            handler: Vec::new(),
         }
     }
 }

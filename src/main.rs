@@ -10,7 +10,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
 mod bar;
@@ -18,6 +18,7 @@ mod cache;
 mod config;
 mod decode;
 mod files;
+mod key_handler;
 mod loader;
 mod tiff;
 mod view;
@@ -38,6 +39,13 @@ struct Args {
     #[arg(short = 'i', long, help = "Read paths from stdin, one per line")]
     stdin: bool,
 
+    #[arg(
+        short = 'o',
+        long,
+        help = "Print the marked files on exit, one per line"
+    )]
+    stdout: bool,
+
     #[arg(short, long, help = "Start in fullscreen")]
     fullscreen: bool,
 }
@@ -45,6 +53,15 @@ struct Args {
 enum ViewerEvent {
     Listed(Vec<PathBuf>),
     Loaded(loader::LoadResult),
+    HandlerDone(Result<key_handler::HandlerChanges, String>),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum HandlerState {
+    Idle,
+    /// The prefix key was pressed, and the next key goes to the handler.
+    Armed,
+    Running,
 }
 
 struct Viewer {
@@ -60,6 +77,10 @@ struct Viewer {
     shown: Option<Arc<decode::RenderedImage>>,
     view: view::View,
     count: Option<usize>,
+    mods: ModifiersState,
+    handler_state: HandlerState,
+    notice: Option<String>,
+    proxy: EventLoopProxy<ViewerEvent>,
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
     err: Option<anyhow::Error>,
@@ -131,10 +152,16 @@ impl Viewer {
 
     fn status(&self) -> (String, String) {
         let cur = self.files.index();
-        let left = self
-            .files
-            .current()
-            .map_or(String::new(), |path| path.display().to_string());
+        let left = match (&self.notice, self.handler_state) {
+            (Some(notice), _) => notice.clone(),
+            (None, HandlerState::Armed) => "key handler: press a key, or Escape to abort".into(),
+            (None, HandlerState::Running) => "key handler: running".into(),
+            (None, HandlerState::Idle) => self
+                .files
+                .current()
+                .map_or(String::new(), |path| path.display().to_string()),
+        };
+        let mark = if self.files.is_marked(cur) { "* " } else { "" };
         let state = if self.files.is_listing {
             "listing "
         } else if self
@@ -150,7 +177,66 @@ impl Viewer {
             .zoom()
             .map_or(String::new(), |zoom| format!("{:.0}% ", zoom * 100.0));
         let nr = if self.files.len() == 0 { 0 } else { cur + 1 };
-        (left, format!("{state}{zoom}{nr}/{}", self.files.len()))
+        (
+            left,
+            format!("{state}{mark}{zoom}{nr}/{}", self.files.len()),
+        )
+    }
+
+    fn reset_view(&mut self) {
+        self.view.pan = (0.0, 0.0);
+        self.view.turns = 0;
+        self.refresh();
+    }
+
+    fn remove_files(&mut self, el: &ActiveEventLoop, paths: &[PathBuf]) {
+        if paths.is_empty() {
+            return;
+        }
+        self.files.remove(paths);
+        self.cache.reindex(|path| self.files.position(0, path));
+        if self.files.len() == 0 {
+            el.exit();
+        }
+        self.reset_view();
+    }
+
+    fn on_handler_key(&mut self, key: &Key) {
+        if *key == Key::Named(NamedKey::Escape) {
+            self.handler_state = HandlerState::Idle;
+            self.request_redraw();
+            return;
+        }
+        let Some(name) = key_handler::key_name(key, self.mods) else {
+            return;
+        };
+        let mut paths = self.files.marked();
+        if paths.is_empty() {
+            paths.extend(self.files.current().cloned());
+        }
+        self.handler_state = HandlerState::Running;
+        key_handler::spawn(self.cfg.handler.clone(), name, paths, self.proxy.clone());
+        self.request_redraw();
+    }
+
+    fn on_handler_done(
+        &mut self,
+        el: &ActiveEventLoop,
+        result: Result<key_handler::HandlerChanges, String>,
+    ) {
+        self.handler_state = HandlerState::Idle;
+        match result {
+            Ok(outcome) => {
+                for path in &outcome.changed {
+                    if let Some(idx) = self.files.position(self.files.index(), path) {
+                        self.cache.remove(idx);
+                    }
+                }
+                self.remove_files(el, &outcome.gone);
+            }
+            Err(err) => self.notice = Some(format!("key handler: {err}")),
+        }
+        self.refresh();
     }
 
     fn refresh(&mut self) {
@@ -284,6 +370,21 @@ impl Viewer {
     }
 
     fn on_key(&mut self, el: &ActiveEventLoop, key: &Key) {
+        self.notice = None;
+        match self.handler_state {
+            HandlerState::Idle => {}
+            HandlerState::Armed => return self.on_handler_key(key),
+            HandlerState::Running => return,
+        }
+        if self.mods.control_key() {
+            match key.as_ref() {
+                Key::Character("x") => self.handler_state = HandlerState::Armed,
+                Key::Character("u") => self.files.clear_marks(),
+                _ => {}
+            }
+            return self.request_redraw();
+        }
+
         let count = self.count.take();
         let n = isize::try_from(count.unwrap_or(1)).unwrap_or(isize::MAX);
         let jump = isize::try_from(self.cfg.jump).unwrap_or(isize::MAX);
@@ -300,6 +401,23 @@ impl Viewer {
             Key::Character("]") => self.files.step(n.saturating_mul(jump)),
             Key::Character("[") => self.files.step(n.saturating_mul(jump).saturating_neg()),
             Key::Character("g") => self.files.go_to(0),
+            Key::Character("N") => self.files.step_marked(n),
+            Key::Character("P") => self.files.step_marked(n.saturating_neg()),
+            Key::Character("m") => {
+                self.files.toggle_mark();
+                self.request_redraw();
+                false
+            }
+            Key::Character("D") => {
+                let current: Vec<_> = self.files.current().cloned().into_iter().collect();
+                self.remove_files(el, &current);
+                false
+            }
+            Key::Character("r") => {
+                self.cache.remove(from);
+                self.refresh();
+                false
+            }
             Key::Character("+") => {
                 self.step_zoom(ZoomStep::In);
                 false
@@ -372,9 +490,7 @@ impl Viewer {
             } else {
                 isize::try_from(from - to).map_or(isize::MIN, |step| -step)
             };
-            self.view.pan = (0.0, 0.0);
-            self.view.turns = 0;
-            self.refresh();
+            self.reset_view();
         }
     }
 
@@ -430,6 +546,7 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
                 self.refresh();
             }
             ViewerEvent::Loaded(loaded) => self.on_loaded(loaded),
+            ViewerEvent::HandlerDone(result) => self.on_handler_done(el, result),
         }
     }
 
@@ -439,6 +556,7 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
             WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
                 self.on_key(el, &event.logical_key);
             }
+            WindowEvent::ModifiersChanged(mods) => self.mods = mods.state(),
             WindowEvent::Resized(_) => self.request_redraw(),
             WindowEvent::RedrawRequested => {
                 let res = self.redraw();
@@ -487,10 +605,21 @@ fn main() -> Result<()> {
         shown: None,
         view: view::View::new(),
         count: None,
+        mods: ModifiersState::empty(),
+        handler_state: HandlerState::Idle,
+        notice: None,
+        proxy: el.create_proxy(),
         window: None,
         surface: None,
         err: None,
     };
     el.run_app(&mut app)?;
+
+    if app.args.stdout {
+        let mut out = std::io::stdout().lock();
+        for path in app.files.marked() {
+            key_handler::write_path(&mut out, &path)?;
+        }
+    }
     app.err.map_or(Ok(()), Err)
 }

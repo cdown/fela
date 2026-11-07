@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 const IMAGE_EXTS: [&str; 4] = ["jpg", "jpeg", "png", "arw"];
@@ -5,6 +6,7 @@ const IMAGE_EXTS: [&str; 4] = ["jpg", "jpeg", "png", "arw"];
 pub struct FileList {
     list: Vec<PathBuf>,
     cur: usize,
+    marked: HashSet<PathBuf>,
     pub is_listing: bool,
 }
 
@@ -74,6 +76,7 @@ impl FileList {
         Self {
             list,
             cur: 0,
+            marked: HashSet::new(),
             is_listing: true,
         }
     }
@@ -119,5 +122,122 @@ impl FileList {
 
     pub fn step(&mut self, delta: isize) -> bool {
         self.go_to(self.cur.saturating_add_signed(delta))
+    }
+
+    pub fn is_marked(&self, idx: usize) -> bool {
+        self.get(idx).is_some_and(|path| self.marked.contains(path))
+    }
+
+    pub fn toggle_mark(&mut self) {
+        let Some(path) = self.current().cloned() else {
+            return;
+        };
+        if !self.marked.remove(&path) {
+            self.marked.insert(path);
+        }
+    }
+
+    pub fn clear_marks(&mut self) {
+        self.marked.clear();
+    }
+
+    pub fn marked(&self) -> Vec<PathBuf> {
+        self.list
+            .iter()
+            .filter(|path| self.marked.contains(*path))
+            .cloned()
+            .collect()
+    }
+
+    pub fn step_marked(&mut self, n: isize) -> bool {
+        let marked = (0..self.list.len()).filter(|idx| self.is_marked(*idx));
+        let nr_skipped = n.unsigned_abs().saturating_sub(1);
+        let target = match n {
+            0 => None,
+            1.. => marked.filter(|idx| *idx > self.cur).nth(nr_skipped),
+            _ => marked.filter(|idx| *idx < self.cur).rev().nth(nr_skipped),
+        };
+        target.is_some_and(|idx| self.go_to(idx))
+    }
+
+    pub fn remove(&mut self, paths: &[PathBuf]) {
+        let nr_kept_before = self.list[..self.cur.min(self.list.len())]
+            .iter()
+            .filter(|path| !paths.contains(path))
+            .count();
+        self.list.retain(|path| !paths.contains(path));
+        self.marked.retain(|path| !paths.contains(path));
+        self.cur = nr_kept_before.min(self.list.len().saturating_sub(1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn files(names: &[&str], cur: usize) -> FileList {
+        let mut files = FileList::new(&[]);
+        files.set_list(names.iter().map(PathBuf::from).collect());
+        files.go_to(cur);
+        files
+    }
+
+    fn mark(files: &mut FileList, idxs: &[usize]) {
+        let cur = files.index();
+        for idx in idxs {
+            files.go_to(*idx);
+            files.toggle_mark();
+        }
+        files.go_to(cur);
+    }
+
+    #[test]
+    fn test_step_marked() {
+        let mut files = files(&["a", "b", "c", "d", "e"], 2);
+        mark(&mut files, &[0, 1, 3, 4]);
+        assert!(files.step_marked(2));
+        assert_eq!(files.index(), 4);
+        assert!(!files.step_marked(1));
+        assert!(files.step_marked(-3));
+        assert_eq!(files.index(), 0);
+        assert!(!files.step_marked(0));
+    }
+
+    #[test]
+    fn test_marked_is_in_list_order() {
+        let mut files = files(&["a", "b", "c"], 0);
+        mark(&mut files, &[2, 0]);
+        assert_eq!(files.marked(), [PathBuf::from("a"), PathBuf::from("c")]);
+    }
+
+    #[test]
+    fn test_remove_keeps_current() {
+        let mut files = files(&["a", "b", "c", "d"], 2);
+        files.remove(&[PathBuf::from("a"), PathBuf::from("d")]);
+        assert_eq!(files.current(), Some(&PathBuf::from("c")));
+        assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn test_remove_current_moves_to_next() {
+        let mut files = files(&["a", "b", "c", "d"], 1);
+        mark(&mut files, &[1]);
+        files.remove(&[PathBuf::from("b")]);
+        assert_eq!(files.current(), Some(&PathBuf::from("c")));
+        assert!(files.marked().is_empty());
+
+        files.go_to(2);
+        files.remove(&[PathBuf::from("d")]);
+        assert_eq!(files.current(), Some(&PathBuf::from("c")));
+    }
+
+    #[test]
+    fn test_set_list_keeps_current() {
+        let mut files = FileList::new(&[PathBuf::from("dir/c.jpg")]);
+        assert_eq!(files.index(), 0);
+        let list = ["dir/a.jpg", "dir/b.png", "dir/c.jpg", "dir/d.ARW"];
+        files.set_list(list.iter().map(PathBuf::from).collect());
+        assert_eq!(files.index(), 2);
+        assert_eq!(files.len(), 4);
     }
 }
