@@ -366,7 +366,9 @@ impl Viewer {
         if bar_h > 0 {
             bar::draw(bar, buf_w, &left, &right);
         }
-        buf.present().map_err(|err| anyhow!("{err}"))
+        buf.present().map_err(|err| anyhow!("{err}"))?;
+
+        Ok(())
     }
 
     fn on_key(&mut self, el: &ActiveEventLoop, key: &Key) {

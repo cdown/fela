@@ -8,6 +8,7 @@ pub struct FileList {
     cur: usize,
     marked: HashSet<PathBuf>,
     pub is_listing: bool,
+    pending_step: isize,
 }
 
 fn has_image_ext(path: &Path) -> bool {
@@ -78,6 +79,7 @@ impl FileList {
             cur: 0,
             marked: HashSet::new(),
             is_listing: true,
+            pending_step: 0,
         }
     }
 
@@ -88,6 +90,8 @@ impl FileList {
         self.cur = cur.unwrap_or(0);
         self.list = list;
         self.is_listing = false;
+        let pending_step = std::mem::take(&mut self.pending_step);
+        self.step(pending_step);
     }
 
     pub fn len(&self) -> usize {
@@ -121,6 +125,10 @@ impl FileList {
     }
 
     pub fn step(&mut self, delta: isize) -> bool {
+        if self.is_listing {
+            self.pending_step = self.pending_step.saturating_add(delta);
+            return false;
+        }
         self.go_to(self.cur.saturating_add_signed(delta))
     }
 
@@ -229,6 +237,17 @@ mod tests {
         files.go_to(2);
         files.remove(&[PathBuf::from("d")]);
         assert_eq!(files.current(), Some(&PathBuf::from("c")));
+    }
+
+    #[test]
+    fn test_steps_while_listing_apply_afterwards() {
+        let mut files = FileList::new(&[PathBuf::from("b.jpg")]);
+        assert!(!files.step(3));
+        assert!(!files.step(-1));
+        assert_eq!(files.current(), Some(&PathBuf::from("b.jpg")));
+        let list = ["a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg"];
+        files.set_list(list.iter().map(PathBuf::from).collect());
+        assert_eq!(files.current(), Some(&PathBuf::from("d.jpg")));
     }
 
     #[test]
