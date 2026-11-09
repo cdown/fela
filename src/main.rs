@@ -6,12 +6,14 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Fullscreen, Window, WindowId};
+use winit::monitor::MonitorHandle;
+use winit::window::{Window, WindowAttributes, WindowId};
 
 mod bar;
 mod cache;
@@ -26,6 +28,12 @@ mod view;
 use view::{ScaleMode, ZoomStep};
 
 const WINDOW_SIZE: PhysicalSize<u32> = PhysicalSize::new(800, 600);
+
+// On Windows, drawing stalls while a new window takes focus. Create it without focus and wait
+// for the first load result or FOCUS_DEADLINE, then draw before asking for focus
+const FOCUS_AFTER_FIRST_IMAGE: bool = cfg!(windows);
+
+const FOCUS_DEADLINE: Duration = Duration::from_millis(50);
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -48,6 +56,41 @@ struct Args {
 
     #[arg(short, long, help = "Start in fullscreen")]
     fullscreen: bool,
+}
+
+#[cfg(windows)]
+fn fullscreen_attrs(attrs: WindowAttributes, monitor: Option<MonitorHandle>) -> WindowAttributes {
+    let Some(monitor) = monitor else {
+        return attrs;
+    };
+    attrs
+        .with_decorations(false)
+        .with_position(monitor.position())
+        .with_inner_size(monitor.size())
+}
+
+#[cfg(not(windows))]
+fn fullscreen_attrs(attrs: WindowAttributes, _: Option<MonitorHandle>) -> WindowAttributes {
+    attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)))
+}
+
+#[cfg(windows)]
+fn set_fullscreen(window: &Window, is_fullscreen: bool) {
+    window.set_decorations(!is_fullscreen);
+    match window.current_monitor().filter(|_| is_fullscreen) {
+        Some(monitor) => {
+            window.set_outer_position(monitor.position());
+            let _ = window.request_inner_size(monitor.size());
+        }
+        None => {
+            let _ = window.request_inner_size(WINDOW_SIZE);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn set_fullscreen(window: &Window, is_fullscreen: bool) {
+    window.set_fullscreen(is_fullscreen.then_some(winit::window::Fullscreen::Borderless(None)));
 }
 
 enum ViewerEvent {
@@ -84,21 +127,33 @@ struct Viewer {
     notice: Option<String>,
     proxy: EventLoopProxy<ViewerEvent>,
     needs_redraw: bool,
+    /// Set while we still have to draw the first frame and take focus, which waits for the first
+    /// image until this time. See `FOCUS_AFTER_FIRST_IMAGE`.
+    focus_by: Option<Instant>,
+    is_fullscreen: bool,
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
     err: Option<anyhow::Error>,
 }
 
 impl Viewer {
-    fn init_window(&mut self, el: &ActiveEventLoop) -> Result<()> {
-        let attrs = Window::default_attributes()
+    fn init_window(&mut self, el: &ActiveEventLoop, monitor: Option<MonitorHandle>) -> Result<()> {
+        let mut attrs = Window::default_attributes()
             .with_title("fela")
             .with_inner_size(WINDOW_SIZE)
-            .with_fullscreen(self.args.fullscreen.then_some(Fullscreen::Borderless(None)));
+            .with_active(!FOCUS_AFTER_FIRST_IMAGE);
+        if self.is_fullscreen {
+            attrs = fullscreen_attrs(attrs, monitor);
+        }
         let window = Rc::new(el.create_window(attrs)?);
         let ctx = softbuffer::Context::new(window.clone()).map_err(|err| anyhow!("{err}"))?;
         self.surface = Some(Surface::new(&ctx, window.clone()).map_err(|err| anyhow!("{err}"))?);
         self.window = Some(window);
+        if FOCUS_AFTER_FIRST_IMAGE {
+            let deadline = Instant::now() + FOCUS_DEADLINE;
+            self.focus_by = Some(deadline);
+            el.set_control_flow(ControlFlow::WaitUntil(deadline));
+        }
         Ok(())
     }
 
@@ -251,10 +306,10 @@ impl Viewer {
         self.request_redraw();
     }
 
-    fn toggle_fullscreen(&self) {
+    fn toggle_fullscreen(&mut self) {
         if let Some(window) = &self.window {
-            let is_fullscreen = window.fullscreen().is_some();
-            window.set_fullscreen((!is_fullscreen).then_some(Fullscreen::Borderless(None)));
+            self.is_fullscreen = !self.is_fullscreen;
+            set_fullscreen(window, self.is_fullscreen);
         }
     }
 
@@ -517,13 +572,6 @@ impl Viewer {
         {
             self.loader.acknowledge(&loaded.job.path);
         }
-        if loaded
-            .result
-            .as_ref()
-            .map_or(true, |prepared| !prepared.is_draft)
-        {
-            self.loader.acknowledge(&loaded.job.path);
-        }
         let Some(idx) = self.files.position(loaded.job.idx, &loaded.job.path) else {
             return;
         };
@@ -553,13 +601,13 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
         let monitor = el
             .primary_monitor()
             .or_else(|| el.available_monitors().next());
-        self.size = match monitor {
-            Some(monitor) if self.args.fullscreen => monitor.size(),
+        self.size = match &monitor {
+            Some(monitor) if self.is_fullscreen => monitor.size(),
             _ => WINDOW_SIZE,
         };
         self.schedule();
 
-        let res = self.init_window(el);
+        let res = self.init_window(el, monitor);
         self.exit_on_err(el, res);
         self.refresh();
     }
@@ -593,9 +641,16 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        if std::mem::take(&mut self.needs_redraw) {
+        let has_image = self.cache.get(self.files.index()).is_some();
+        let is_holding = !has_image && self.focus_by.is_some_and(|by| Instant::now() < by);
+        if !is_holding && std::mem::take(&mut self.needs_redraw) {
             let res = self.redraw();
             self.exit_on_err(el, res);
+        }
+        if let (false, Some(_), Some(window)) = (is_holding, self.focus_by, &self.window) {
+            window.focus_window();
+            self.focus_by = None;
+            el.set_control_flow(ControlFlow::Wait);
         }
     }
 }
@@ -629,6 +684,7 @@ fn main() -> Result<()> {
     let mut app = Viewer {
         cache: cache::ImageCache::new(cfg.cache_mb),
         loader: loader::Loader::new(cfg.prefetch_inflight, el.create_proxy(), gate_tx),
+        is_fullscreen: args.fullscreen,
         args,
         cfg,
         files,
@@ -644,6 +700,7 @@ fn main() -> Result<()> {
         notice: None,
         proxy: el.create_proxy(),
         needs_redraw: false,
+        focus_by: None,
         window: None,
         surface: None,
         err: None,
