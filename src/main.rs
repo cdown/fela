@@ -75,6 +75,8 @@ struct Viewer {
     /// How far the last navigation moved, as a hint for where the next one will go.
     last_step: isize,
     shown: Option<Arc<decode::RenderedImage>>,
+    /// The images we were on since the current image was last on screen, oldest first.
+    trail: Vec<usize>,
     view: view::View,
     count: Option<usize>,
     mods: ModifiersState,
@@ -195,6 +197,7 @@ impl Viewer {
         }
         self.files.remove(paths);
         self.cache.reindex(|path| self.files.position(0, path));
+        self.trail.clear();
         if self.files.len() == 0 {
             el.exit();
         }
@@ -324,12 +327,9 @@ impl Viewer {
             self.schedule();
         }
 
+        let cur = self.files.index();
         let mut message = None;
-        match self
-            .cache
-            .get(self.files.index())
-            .map(|entry| &entry.result)
-        {
+        match self.cache.get(cur).map(|entry| &entry.result) {
             Some(Ok(ready)) => {
                 self.shown = Some(Arc::clone(&ready.fit));
                 if let (ScaleMode::Zoom(zoom), Some(full)) = (self.view.scale, &ready.full) {
@@ -339,12 +339,23 @@ impl Viewer {
                     let frame = decode::render(full, turns, region.crop, region.w, region.h)?;
                     self.shown = Some(Arc::new(frame));
                 }
+                self.trail.clear();
             }
             Some(Err(err)) => {
                 self.shown = None;
+                self.trail.clear();
                 message = Some(err.clone());
             }
-            None => {}
+            None => {
+                let is_ready = |idx: &usize| self.cache.get(*idx).is_some_and(|e| e.result.is_ok());
+                if let Some(nr) = self.trail.iter().rposition(is_ready) {
+                    let idx = self.trail[nr];
+                    if let Some(Ok(ready)) = self.cache.get(idx).map(|entry| &entry.result) {
+                        self.shown = Some(Arc::clone(&ready.fit));
+                    }
+                    self.trail.drain(..=nr);
+                }
+            }
         }
         let (left, right) = self.status();
 
@@ -492,6 +503,7 @@ impl Viewer {
             } else {
                 isize::try_from(from - to).map_or(isize::MIN, |step| -step)
             };
+            self.trail.push(from);
             self.reset_view();
         }
     }
@@ -504,7 +516,7 @@ impl Viewer {
         self.cache.insert(idx, loaded);
         self.cache.trim(cur);
         self.schedule();
-        if idx == cur {
+        if idx == cur || self.cache.get(cur).is_none() {
             self.request_redraw();
         }
     }
@@ -545,6 +557,7 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
             ViewerEvent::Listed(list) => {
                 self.files.set_list(list);
                 self.cache.reindex(|path| self.files.position(0, path));
+                self.trail.clear();
                 self.refresh();
             }
             ViewerEvent::Loaded(loaded) => self.on_loaded(loaded),
@@ -605,6 +618,7 @@ fn main() -> Result<()> {
         is_bar_shown: true,
         last_step: 1,
         shown: None,
+        trail: Vec::new(),
         view: view::View::new(),
         count: None,
         mods: ModifiersState::empty(),
