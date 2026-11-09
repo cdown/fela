@@ -62,7 +62,7 @@ pub fn decode(data: &[u8], orientation: Option<u16>) -> Result<DecodedImage> {
 }
 
 fn decode_jpeg(data: &[u8], orientation: Option<u16>) -> Result<DecodedImage> {
-    let opts = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGBA);
+    let opts = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
     let mut dec = JpegDecoder::new_with_options(ZCursor::new(data), opts);
     let px = dec.decode().map_err(|err| anyhow!("{err}"))?;
     let info = dec.info().context("BUG: no JPEG info after decode")?;
@@ -85,20 +85,20 @@ fn decode_png(data: &[u8]) -> Result<DecodedImage> {
     let info = reader.next_frame(&mut buf)?;
     buf.truncate(info.buffer_size());
 
-    let mut px: Vec<u8> = match info.color_type {
-        png::ColorType::Rgba => buf,
+    let blend = |c: u8, alpha: u8| {
+        u8::try_from(u16::from(c) * u16::from(alpha) / 255).expect("BUG: blend exceeds u8")
+    };
+    let px = match info.color_type {
+        png::ColorType::Rgba => buf
+            .chunks_exact(4)
+            .flat_map(|p| [blend(p[0], p[3]), blend(p[1], p[3]), blend(p[2], p[3])])
+            .collect(),
         png::ColorType::GrayscaleAlpha => buf
             .chunks_exact(2)
-            .flat_map(|p| [p[0], p[0], p[0], p[1]])
+            .flat_map(|p| [blend(p[0], p[1]); 3])
             .collect(),
         other => bail!("Unexpected PNG colour type {other:?}"),
     };
-    for p in px.chunks_exact_mut(4) {
-        let alpha = u16::from(p[3]);
-        for c in &mut p[..3] {
-            *c = u8::try_from(u16::from(*c) * alpha / 255).expect("BUG: blend exceeds u8");
-        }
-    }
     Ok(DecodedImage {
         w: info.width,
         h: info.height,
@@ -157,8 +157,8 @@ pub fn render(
     let (crop_w, crop_h) = (crop_w.min(img_w - left), crop_h.min(img_h - top));
     let (w, h) = if turns % 2 == 1 { (h, w) } else { (w, h) };
 
-    let src = fr::images::ImageRef::new(img.w, img.h, &img.px, fr::PixelType::U8x4)?;
-    let mut dst = fr::images::Image::new(w, h, fr::PixelType::U8x4);
+    let src = fr::images::ImageRef::new(img.w, img.h, &img.px, fr::PixelType::U8x3)?;
+    let mut dst = fr::images::Image::new(w, h, fr::PixelType::U8x3);
     let filter = if f64::from(w) < crop_w {
         fr::FilterType::Box
     } else {
@@ -172,7 +172,7 @@ pub fn render(
 
     let px = dst
         .buffer()
-        .chunks_exact(4)
+        .chunks_exact(3)
         .map(|p| u32::from(p[0]) << 16 | u32::from(p[1]) << 8 | u32::from(p[2]))
         .collect();
     Ok(rotate(RenderedImage { w, h, px }, turns))
