@@ -83,6 +83,7 @@ struct Viewer {
     handler_state: HandlerState,
     notice: Option<String>,
     proxy: EventLoopProxy<ViewerEvent>,
+    needs_redraw: bool,
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
     err: Option<anyhow::Error>,
@@ -101,10 +102,10 @@ impl Viewer {
         Ok(())
     }
 
-    fn request_redraw(&self) {
-        if let Some(window) = &self.window {
-            window.request_redraw();
-        }
+    /// We don't leave the timing to the windowing system, as Windows can take ~200ms to ask a new
+    /// window to paint itself.
+    fn request_redraw(&mut self) {
+        self.needs_redraw = true;
     }
 
     fn bar_height(&self) -> usize {
@@ -516,6 +517,13 @@ impl Viewer {
         {
             self.loader.acknowledge(&loaded.job.path);
         }
+        if loaded
+            .result
+            .as_ref()
+            .map_or(true, |prepared| !prepared.is_draft)
+        {
+            self.loader.acknowledge(&loaded.job.path);
+        }
         let Some(idx) = self.files.position(loaded.job.idx, &loaded.job.path) else {
             return;
         };
@@ -579,12 +587,15 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
                 self.on_key(el, &event.logical_key);
             }
             WindowEvent::ModifiersChanged(mods) => self.mods = mods.state(),
-            WindowEvent::Resized(_) => self.request_redraw(),
-            WindowEvent::RedrawRequested => {
-                let res = self.redraw();
-                self.exit_on_err(el, res);
-            }
+            WindowEvent::Resized(_) | WindowEvent::RedrawRequested => self.request_redraw(),
             _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        if std::mem::take(&mut self.needs_redraw) {
+            let res = self.redraw();
+            self.exit_on_err(el, res);
         }
     }
 }
@@ -632,6 +643,7 @@ fn main() -> Result<()> {
         handler_state: HandlerState::Idle,
         notice: None,
         proxy: el.create_proxy(),
+        needs_redraw: false,
         window: None,
         surface: None,
         err: None,
