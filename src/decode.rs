@@ -132,6 +132,70 @@ pub fn fit(
     render(img, turns, crop, dim(w), dim(h))
 }
 
+/// Scaling down is limited by how fast memory can be read, so having more threads doesn't really
+/// help here.
+const NR_SCALE_THREADS: usize = 4;
+
+#[derive(Clone, Copy)]
+struct UnrotatedRect {
+    left: f64,
+    top: f64,
+    w: f64,
+    h: f64,
+}
+
+fn scale_rows(
+    img: &DecodedImage,
+    src: UnrotatedRect,
+    (w, h): (u32, u32),
+    first_row: usize,
+    out: &mut [u32],
+) -> Result<()> {
+    let nr_rows = out.len() / w as usize;
+    let src_rows_per_row = src.h / f64::from(h);
+    let top = src.top + first_row as f64 * src_rows_per_row;
+    let from = fr::images::ImageRef::new(img.w, img.h, &img.px, fr::PixelType::U8x3)?;
+    let mut to = fr::images::Image::new(w, u32::try_from(nr_rows)?, fr::PixelType::U8x3);
+    let filter = if f64::from(w) < src.w {
+        fr::FilterType::Box
+    } else {
+        fr::FilterType::Bilinear
+    };
+    let opts = fr::ResizeOptions::new()
+        .crop(src.left, top, src.w, nr_rows as f64 * src_rows_per_row)
+        .resize_alg(fr::ResizeAlg::Convolution(filter))
+        .use_alpha(false);
+    fr::Resizer::new().resize(&from, &mut to, &opts)?;
+
+    for (out, p) in out.iter_mut().zip(to.buffer().chunks_exact(3)) {
+        *out = u32::from(p[0]) << 16 | u32::from(p[1]) << 8 | u32::from(p[2]);
+    }
+    Ok(())
+}
+
+fn scale(
+    img: &DecodedImage,
+    src: UnrotatedRect,
+    (w, h): (u32, u32),
+    nr_threads: usize,
+) -> Result<Vec<u32>> {
+    let mut px = vec![0; w as usize * h as usize];
+    let rows_per_thread = (h as usize).div_ceil(nr_threads);
+    std::thread::scope(|scope| {
+        let threads: Vec<_> = px
+            .chunks_mut(rows_per_thread * w as usize)
+            .enumerate()
+            .map(|(nr, out)| {
+                scope.spawn(move || scale_rows(img, src, (w, h), nr * rows_per_thread, out))
+            })
+            .collect();
+        threads
+            .into_iter()
+            .try_for_each(|thread| thread.join().expect("BUG: scaling thread panicked"))
+    })?;
+    Ok(px)
+}
+
 pub fn render(
     img: &DecodedImage,
     turns: u8,
@@ -142,7 +206,7 @@ pub fn render(
     let turns = (img.turns + turns) % 4;
     let (img_w, img_h) = (f64::from(img.w), f64::from(img.h));
     // The pixels we have are not rotated, so this needs translation
-    let (left, top, crop_w, crop_h) = match turns {
+    let (left, top, src_w, src_h) = match turns {
         1 => (crop.y, img_h - crop.x - crop.w, crop.h, crop.w),
         2 => (
             img_w - crop.x - crop.w,
@@ -154,27 +218,22 @@ pub fn render(
         _ => (crop.x, crop.y, crop.w, crop.h),
     };
     let (left, top) = (left.clamp(0.0, img_w - 1.0), top.clamp(0.0, img_h - 1.0));
-    let (crop_w, crop_h) = (crop_w.min(img_w - left), crop_h.min(img_h - top));
+    let src = UnrotatedRect {
+        left,
+        top,
+        w: src_w.min(img_w - left),
+        h: src_h.min(img_h - top),
+    };
     let (w, h) = if turns % 2 == 1 { (h, w) } else { (w, h) };
 
-    let src = fr::images::ImageRef::new(img.w, img.h, &img.px, fr::PixelType::U8x3)?;
-    let mut dst = fr::images::Image::new(w, h, fr::PixelType::U8x3);
-    let filter = if f64::from(w) < crop_w {
-        fr::FilterType::Box
+    // Rows can only be scaled independently of each other without leaving seams if the filter
+    // looks at nothing beyond what it is shrinking. That's the case for box, but not for bilinear.
+    let nr_threads = if f64::from(w) < src.w {
+        NR_SCALE_THREADS
     } else {
-        fr::FilterType::Bilinear
+        1
     };
-    let opts = fr::ResizeOptions::new()
-        .crop(left, top, crop_w, crop_h)
-        .resize_alg(fr::ResizeAlg::Convolution(filter))
-        .use_alpha(false);
-    fr::Resizer::new().resize(&src, &mut dst, &opts)?;
-
-    let px = dst
-        .buffer()
-        .chunks_exact(3)
-        .map(|p| u32::from(p[0]) << 16 | u32::from(p[1]) << 8 | u32::from(p[2]))
-        .collect();
+    let px = scale(img, src, (w, h), nr_threads)?;
     Ok(rotate(RenderedImage { w, h, px }, turns))
 }
 
@@ -210,6 +269,29 @@ fn rotate(frame: RenderedImage, turns: u8) -> RenderedImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_scale_in_bands_matches_scaling_at_once() {
+        let (w, h) = (403u32, 301u32);
+        let mut seed = 1u32;
+        let px = std::iter::repeat_with(|| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed.to_le_bytes()[3]
+        })
+        .take((w * h * 3) as usize)
+        .collect();
+        let img = DecodedImage { w, h, px, turns: 0 };
+        let src = UnrotatedRect {
+            left: 10.5,
+            top: 7.25,
+            w: 380.0,
+            h: 290.0,
+        };
+        let at_once = scale(&img, src, (97, 73), 1).unwrap();
+        for nr_threads in [2, 4, 7] {
+            assert_eq!(scale(&img, src, (97, 73), nr_threads).unwrap(), at_once);
+        }
+    }
 
     fn frame_2x3() -> RenderedImage {
         RenderedImage {
