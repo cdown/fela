@@ -509,6 +509,13 @@ impl Viewer {
     }
 
     fn on_loaded(&mut self, loaded: loader::LoadResult) {
+        if loaded
+            .result
+            .as_ref()
+            .map_or(true, |prepared| !prepared.is_draft)
+        {
+            self.loader.acknowledge(&loaded.job.path);
+        }
         let Some(idx) = self.files.position(loaded.job.idx, &loaded.job.path) else {
             return;
         };

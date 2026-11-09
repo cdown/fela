@@ -32,6 +32,11 @@ pub struct LoadJob {
     pub full: Option<Arc<DecodedImage>>,
 }
 
+struct Source {
+    data: Vec<u8>,
+    orientation: Option<u16>,
+}
+
 pub struct PreparedImage {
     pub fit: Arc<RenderedImage>,
     pub full: Option<Arc<DecodedImage>>,
@@ -48,6 +53,8 @@ pub struct LoadResult {
 enum Phase {
     Reading,
     Decoding,
+    // Keep the job until the UI sees its result so a new request cannot start it again.
+    Sent,
 }
 
 #[derive(Default)]
@@ -67,6 +74,12 @@ impl LoadQueue {
             .map(|(_, phase)| *phase)
     }
 
+    fn set_phase(&mut self, path: &Path, phase: Phase) {
+        if let Some(running) = self.running.iter_mut().find(|(running, _)| running == path) {
+            running.1 = phase;
+        }
+    }
+
     fn is_wanted(&self, path: &Path) -> bool {
         self.current
             .iter()
@@ -83,7 +96,8 @@ impl LoadQueue {
             }
             // The worker reserved for the current image will get to it soon even if it has not
             // been picked up yet, so wait for that as well.
-            if current.full.is_none() && self.phase(&current.path) != Some(Phase::Decoding) {
+            let is_reading = matches!(self.phase(&current.path), None | Some(Phase::Reading));
+            if current.full.is_none() && is_reading {
                 return self.is_wanted(path).then_some(false);
             }
         }
@@ -148,24 +162,22 @@ impl SharedLoader {
 
     fn start_decoding(&self, path: &Path) -> bool {
         let mut state = self.lock();
-        if let Some(running) = state
-            .running
-            .iter_mut()
-            .find(|(running, _)| running == path)
-        {
-            running.1 = Phase::Decoding;
-        }
+        state.set_phase(path, Phase::Decoding);
         self.wake.notify_all();
         state.is_wanted(path)
     }
 
-    fn finish(&self, path: &Path, is_done: bool) {
+    fn finish(&self, path: &Path) {
+        let mut state = self.lock();
+        state.set_phase(path, Phase::Sent);
+        state.current.take_if(|job| job.path == path);
+        state.prefetch.retain(|job| job.path != path);
+        self.wake.notify_all();
+    }
+
+    fn forget(&self, path: &Path) {
         let mut state = self.lock();
         state.running.retain(|(running, _)| running != path);
-        if is_done {
-            state.current.take_if(|job| job.path == path);
-            state.prefetch.retain(|job| job.path != path);
-        }
         self.wake.notify_all();
     }
 
@@ -235,7 +247,7 @@ impl SharedLoader {
         }
     }
 
-    fn read(&self, job: &LoadJob) -> Result<Option<(Vec<u8>, Option<u16>)>> {
+    fn read(&self, job: &LoadJob) -> Result<Option<Source>> {
         let path = &job.path;
         if !self.wait_for_disk(path) {
             return Ok(None);
@@ -250,7 +262,10 @@ impl SharedLoader {
             let offset = u64::try_from(head.len())?;
             let nr_left = len - head.len();
             let is_complete = self.read_range(path, &mut file, offset, nr_left, &mut head)?;
-            return Ok(is_complete.then_some((head, None)));
+            return Ok(is_complete.then_some(Source {
+                data: head,
+                orientation: None,
+            }));
         }
 
         let embedded = tiff::find_embedded(&head)?;
@@ -261,7 +276,10 @@ impl SharedLoader {
             self.send_draft(job, &data, embedded.orientation);
         }
         let data = self.read_span(path, &mut file, &head, embedded.full)?;
-        Ok(data.map(|data| (data, Some(embedded.orientation))))
+        Ok(data.map(|data| Source {
+            data,
+            orientation: Some(embedded.orientation),
+        }))
     }
 
     /// None means the job was abandoned because it is no longer wanted.
@@ -269,18 +287,18 @@ impl SharedLoader {
         let full = match &job.full {
             Some(full) => Arc::clone(full),
             None => {
-                let data = self.read(job);
+                let source = self.read(job);
                 self.lister_gate
                     .lock()
                     .expect("BUG: lister gate poisoned")
                     .take();
-                let Some((data, orientation)) = data? else {
+                let Some(source) = source? else {
                     return Ok(None);
                 };
                 if !self.start_decoding(&job.path) {
                     return Ok(None);
                 }
-                Arc::new(decode::decode(&data, orientation)?)
+                Arc::new(decode::decode(&source.data, source.orientation)?)
             }
         };
         let spec = job.spec;
@@ -296,10 +314,12 @@ impl SharedLoader {
     fn work(&self, is_reserved: bool) {
         loop {
             let job = self.next_job(is_reserved);
-            let result = self.run(&job).map_err(|err| format!("{err:#}")).transpose();
-            self.finish(&job.path, result.is_some());
-            if let Some(result) = result {
-                self.send(&job, result);
+            match self.run(&job).map_err(|err| format!("{err:#}")).transpose() {
+                Some(result) => {
+                    self.finish(&job.path);
+                    self.send(&job, result);
+                }
+                None => self.forget(&job.path),
             }
         }
     }
@@ -326,6 +346,11 @@ impl Loader {
             std::thread::spawn(move || shared.work(nr == 0));
         }
         Self { shared }
+    }
+
+    /// The UI thread has seen the final result for `path`.
+    pub fn acknowledge(&self, path: &Path) {
+        self.shared.forget(path);
     }
 
     pub fn set_jobs(&self, current: Option<LoadJob>, prefetch: Vec<LoadJob>) {
