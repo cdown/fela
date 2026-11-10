@@ -182,7 +182,7 @@ impl Viewer {
         }
         let entry = self.cache.get(self.files.index())?;
         let ready = entry.result.as_ref().ok().filter(|ready| !ready.is_draft)?;
-        Some(f64::from(ready.fit.w) / f64::from(ready.size.0))
+        Some(f64::from(ready.fitted.w) / f64::from(ready.upright_size.0))
     }
 
     fn step_zoom(&mut self, step: ZoomStep) {
@@ -316,32 +316,32 @@ impl Viewer {
     fn job_for(&self, idx: usize) -> Option<loader::LoadJob> {
         let is_current = idx == self.files.index();
         let (w, h) = self.area();
-        let spec = loader::Spec {
+        let fit_params = decode::FitParams {
             w,
             h,
             upscale: self.view.scale == ScaleMode::Fit,
             turns: if is_current { self.view.turns } else { 0 },
         };
-        let needs_full = is_current && matches!(self.view.scale, ScaleMode::Zoom(_));
+        let needs_original = is_current && matches!(self.view.scale, ScaleMode::Zoom(_));
 
-        let full = match self.cache.get(idx) {
+        let original = match self.cache.get(idx) {
             None => None,
             Some(entry) => match &entry.result {
                 Err(_) => return None,
                 Ok(ready) => {
-                    let is_fitted = entry.spec == spec && !ready.is_draft;
-                    if is_fitted && (ready.full.is_some() || !needs_full) {
+                    let is_fitted = entry.fit_params == fit_params && !ready.is_draft;
+                    if is_fitted && (ready.original.is_some() || !needs_original) {
                         return None;
                     }
-                    ready.full.clone()
+                    ready.original.clone()
                 }
             },
         };
         Some(loader::LoadJob {
             idx,
             path: self.files.get(idx)?.clone(),
-            spec,
-            full,
+            fit_params,
+            original,
         })
     }
 
@@ -387,12 +387,13 @@ impl Viewer {
         let mut message = None;
         match self.cache.get(cur).map(|entry| &entry.result) {
             Some(Ok(ready)) => {
-                self.shown = Some(Arc::clone(&ready.fit));
-                if let (ScaleMode::Zoom(zoom), Some(full)) = (self.view.scale, &ready.full) {
-                    let img_size = full.upright_size(self.view.turns);
+                self.shown = Some(Arc::clone(&ready.fitted));
+                if let (ScaleMode::Zoom(zoom), Some(original)) = (self.view.scale, &ready.original)
+                {
+                    let img_size = original.upright_size(self.view.turns);
                     let region = self.view.region(zoom, img_size, self.area());
                     let turns = self.view.turns;
-                    let frame = decode::render(full, turns, region.crop, region.w, region.h)?;
+                    let frame = decode::render(original, turns, region.crop, region.w, region.h)?;
                     self.shown = Some(Arc::new(frame));
                 }
                 self.trail.clear();
@@ -407,7 +408,7 @@ impl Viewer {
                 if let Some(nr) = self.trail.iter().rposition(is_ready) {
                     let idx = self.trail[nr];
                     if let Some(Ok(ready)) = self.cache.get(idx).map(|entry| &entry.result) {
-                        self.shown = Some(Arc::clone(&ready.fit));
+                        self.shown = Some(Arc::clone(&ready.fitted));
                     }
                     self.trail.drain(..=nr);
                 }

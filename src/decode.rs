@@ -42,6 +42,22 @@ pub struct RenderedImage {
     pub px: Vec<u32>,
 }
 
+#[derive(Clone, Copy)]
+struct UnrotatedRect {
+    left: f64,
+    top: f64,
+    w: f64,
+    h: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FitParams {
+    pub w: u32,
+    pub h: u32,
+    pub upscale: bool,
+    pub turns: u8,
+}
+
 fn turns_for(orientation: u16) -> u8 {
     match orientation {
         6 => 1,
@@ -107,13 +123,13 @@ fn decode_png(data: &[u8]) -> Result<DecodedImage> {
     })
 }
 
-pub fn fit(
-    img: &DecodedImage,
-    box_w: u32,
-    box_h: u32,
-    upscale: bool,
-    turns: u8,
-) -> Result<RenderedImage> {
+pub fn fit(img: &DecodedImage, params: FitParams) -> Result<RenderedImage> {
+    let FitParams {
+        w: box_w,
+        h: box_h,
+        upscale,
+        turns,
+    } = params;
     let (w, h) = img.upright_size(turns);
     let mut scale = f64::min(
         f64::from(box_w) / f64::from(w),
@@ -135,14 +151,6 @@ pub fn fit(
 /// Scaling down is limited by how fast memory can be read, so having more threads doesn't really
 /// help here.
 const NR_SCALE_THREADS: usize = 4;
-
-#[derive(Clone, Copy)]
-struct UnrotatedRect {
-    left: f64,
-    top: f64,
-    w: f64,
-    h: f64,
-}
 
 fn scale_rows(
     img: &DecodedImage,
@@ -205,6 +213,7 @@ pub fn render(
 ) -> Result<RenderedImage> {
     let turns = (img.turns + turns) % 4;
     let (img_w, img_h) = (f64::from(img.w), f64::from(img.h));
+
     // The pixels we have are not rotated, so this needs translation
     let (left, top, src_w, src_h) = match turns {
         1 => (crop.y, img_h - crop.x - crop.w, crop.h, crop.w),

@@ -1,4 +1,4 @@
-use crate::decode::{self, DecodedImage, RenderedImage};
+use crate::decode::{self, DecodedImage, FitParams, RenderedImage};
 use crate::tiff;
 use crate::ViewerEvent;
 use anyhow::{ensure, Result};
@@ -15,32 +15,24 @@ const CHUNK: usize = 1 << 20;
 /// Enough of a RAW to find the JPEGs embedded in it. On the A1 II the last IFD ends 145KB in.
 const HEAD_LEN: usize = 256 << 10;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Spec {
-    pub w: u32,
-    pub h: u32,
-    pub upscale: bool,
-    pub turns: u8,
-}
-
 #[derive(Clone)]
 pub struct LoadJob {
     pub idx: usize,
     pub path: PathBuf,
-    pub spec: Spec,
+    pub fit_params: FitParams,
     /// The decoded image if we still have it, in which case it only needs scaling.
-    pub full: Option<Arc<DecodedImage>>,
+    pub original: Option<Arc<DecodedImage>>,
 }
 
-struct Source {
+struct EncodedImage {
     data: Vec<u8>,
     orientation: Option<u16>,
 }
 
 pub struct PreparedImage {
-    pub fit: Arc<RenderedImage>,
-    pub full: Option<Arc<DecodedImage>>,
-    pub size: (u32, u32),
+    pub fitted: Arc<RenderedImage>,
+    pub original: Option<Arc<DecodedImage>>,
+    pub upright_size: (u32, u32),
     pub is_draft: bool,
 }
 
@@ -54,7 +46,25 @@ enum Phase {
     Reading,
     Decoding,
     // Keep the job until the UI sees its result so a new request cannot start it again.
-    Sent,
+    AwaitingAck,
+}
+
+struct InFlight {
+    path: PathBuf,
+    phase: Phase,
+    was_current: bool,
+}
+
+enum ReadTurn {
+    Read,
+    Wait,
+    Cancelled,
+}
+
+#[derive(PartialEq, Eq)]
+enum JobStatus {
+    Continue,
+    Cancelled,
 }
 
 #[derive(Default)]
@@ -63,20 +73,21 @@ struct LoadQueue {
     current: Option<LoadJob>,
     /// Images the user is likely to look at next, most likely first.
     prefetch: Vec<LoadJob>,
-    running: Vec<(PathBuf, Phase)>,
+    in_flight: Vec<InFlight>,
 }
 
 impl LoadQueue {
+    fn in_flight(&self, path: &Path) -> Option<&InFlight> {
+        self.in_flight.iter().find(|job| job.path == path)
+    }
+
     fn phase(&self, path: &Path) -> Option<Phase> {
-        self.running
-            .iter()
-            .find(|(running, _)| running == path)
-            .map(|(_, phase)| *phase)
+        self.in_flight(path).map(|job| job.phase)
     }
 
     fn set_phase(&mut self, path: &Path, phase: Phase) {
-        if let Some(running) = self.running.iter_mut().find(|(running, _)| running == path) {
-            running.1 = phase;
+        if let Some(job) = self.in_flight.iter_mut().find(|job| job.path == path) {
+            job.phase = phase;
         }
     }
 
@@ -89,23 +100,33 @@ impl LoadQueue {
 
     /// Reads happen one at a time and in priority order, since on slow storage a speculative read
     /// would otherwise delay the one the user is waiting for. Decoding is not limited like this.
-    fn may_read(&self, path: &Path) -> Option<bool> {
+    fn read_turn(&self, path: &Path) -> ReadTurn {
         if let Some(current) = &self.current {
             if current.path == path {
-                return Some(true);
+                return ReadTurn::Read;
             }
             // The worker reserved for the current image will get to it soon even if it has not
             // been picked up yet, so wait for that as well.
             let is_reading = matches!(self.phase(&current.path), None | Some(Phase::Reading));
-            if current.full.is_none() && is_reading {
-                return self.is_wanted(path).then_some(false);
+            if current.original.is_none() && is_reading {
+                return if self.is_wanted(path) {
+                    ReadTurn::Wait
+                } else {
+                    ReadTurn::Cancelled
+                };
             }
         }
-        let ahead = self.prefetch.iter().position(|job| job.path == path)?;
+        let Some(ahead) = self.prefetch.iter().position(|job| job.path == path) else {
+            return ReadTurn::Cancelled;
+        };
         let is_blocked = self.prefetch[..ahead]
             .iter()
             .any(|job| self.phase(&job.path) == Some(Phase::Reading));
-        Some(!is_blocked)
+        if is_blocked {
+            ReadTurn::Wait
+        } else {
+            ReadTurn::Read
+        }
     }
 }
 
@@ -137,39 +158,60 @@ impl SharedLoader {
                 .find(|job| state.phase(&job.path).is_none())
                 .cloned();
             if let Some(job) = job {
-                let phase = if job.full.is_some() {
+                let phase = if job.original.is_some() {
                     Phase::Decoding
                 } else {
                     Phase::Reading
                 };
-                state.running.push((job.path.clone(), phase));
+                let was_current = state.current.as_ref().is_some_and(|c| c.path == job.path);
+                state.in_flight.push(InFlight {
+                    path: job.path.clone(),
+                    phase,
+                    was_current,
+                });
                 return job;
             }
             state = self.wake.wait(state).expect("BUG: loader state poisoned");
         }
     }
 
-    fn wait_for_disk(&self, path: &Path) -> bool {
+    // On slow storage, cancelling every superseded read while moving quickly would leave nothing
+    // to show. Finish reading the draft of any image that was current, even after the user moves
+    // on.
+    fn wait_for_disk(&self, path: &Path, is_for_draft: bool) -> JobStatus {
         let mut state = self.lock();
         loop {
-            match state.may_read(path) {
-                Some(true) => return true,
-                Some(false) => state = self.wake.wait(state).expect("BUG: loader state poisoned"),
-                None => return false,
+            match state.read_turn(path) {
+                ReadTurn::Read => return JobStatus::Continue,
+                ReadTurn::Wait => {
+                    state = self.wake.wait(state).expect("BUG: loader state poisoned")
+                }
+                ReadTurn::Cancelled => {
+                    let was_current = state.in_flight(path).is_some_and(|job| job.was_current);
+                    return if is_for_draft && was_current {
+                        JobStatus::Continue
+                    } else {
+                        JobStatus::Cancelled
+                    };
+                }
             }
         }
     }
 
-    fn start_decoding(&self, path: &Path) -> bool {
+    fn start_decoding(&self, path: &Path) -> JobStatus {
         let mut state = self.lock();
         state.set_phase(path, Phase::Decoding);
         self.wake.notify_all();
-        state.is_wanted(path)
+        if state.is_wanted(path) {
+            JobStatus::Continue
+        } else {
+            JobStatus::Cancelled
+        }
     }
 
     fn finish(&self, path: &Path) {
         let mut state = self.lock();
-        state.set_phase(path, Phase::Sent);
+        state.set_phase(path, Phase::AwaitingAck);
         state.current.take_if(|job| job.path == path);
         state.prefetch.retain(|job| job.path != path);
         self.wake.notify_all();
@@ -177,7 +219,7 @@ impl SharedLoader {
 
     fn forget(&self, path: &Path) {
         let mut state = self.lock();
-        state.running.retain(|(running, _)| running != path);
+        state.in_flight.retain(|job| job.path != path);
         self.wake.notify_all();
     }
 
@@ -188,20 +230,21 @@ impl SharedLoader {
         offset: u64,
         len: usize,
         data: &mut Vec<u8>,
-    ) -> Result<bool> {
+        is_for_draft: bool,
+    ) -> Result<JobStatus> {
         file.seek(SeekFrom::Start(offset))?;
         data.reserve_exact(len);
         let mut left = len;
         while left > 0 {
-            if !self.wait_for_disk(path) {
-                return Ok(false);
+            if self.wait_for_disk(path, is_for_draft) == JobStatus::Cancelled {
+                return Ok(JobStatus::Cancelled);
             }
             let limit = u64::try_from(left.min(CHUNK))?;
             let nr_read = file.by_ref().take(limit).read_to_end(data)?;
             ensure!(nr_read > 0, "file is shorter than expected");
             left -= nr_read;
         }
-        Ok(true)
+        Ok(JobStatus::Continue)
     }
 
     fn read_span(
@@ -210,6 +253,7 @@ impl SharedLoader {
         file: &mut File,
         head: &[u8],
         span: tiff::ByteRange,
+        is_for_draft: bool,
     ) -> Result<Option<Vec<u8>>> {
         let nr_have = head.len().saturating_sub(span.offset).min(span.len);
         let mut data = head
@@ -217,8 +261,9 @@ impl SharedLoader {
             .unwrap_or_default()
             .to_vec();
         let offset = u64::try_from(span.offset + nr_have)?;
-        let is_complete = self.read_range(path, file, offset, span.len - nr_have, &mut data)?;
-        Ok(is_complete.then_some(data))
+        let nr_left = span.len - nr_have;
+        let status = self.read_range(path, file, offset, nr_left, &mut data, is_for_draft)?;
+        Ok((status == JobStatus::Continue).then_some(data))
     }
 
     fn send(&self, job: &LoadJob, result: Result<PreparedImage, String>) {
@@ -232,37 +277,45 @@ impl SharedLoader {
 
     /// Decoding the full size JPEG is slow, but the smaller one is usually fast, so draft it
     fn send_draft(&self, job: &LoadJob, data: &[u8], orientation: u16) {
-        let spec = job.spec;
+        let fit_params = job.fit_params;
         let Ok(img) = decode::decode(data, Some(orientation)) else {
             return;
         };
-        if let Ok(fit) = decode::fit(&img, spec.w, spec.h, true, spec.turns) {
+        if let Ok(fitted) = decode::fit(
+            &img,
+            FitParams {
+                upscale: true,
+                ..fit_params
+            },
+        ) {
             let prepared = PreparedImage {
-                fit: Arc::new(fit),
-                full: None,
-                size: img.upright_size(spec.turns),
+                fitted: Arc::new(fitted),
+                original: None,
+                upright_size: img.upright_size(fit_params.turns),
                 is_draft: true,
             };
             self.send(job, Ok(prepared));
         }
     }
 
-    fn read(&self, job: &LoadJob) -> Result<Option<Source>> {
+    fn read(&self, job: &LoadJob) -> Result<Option<EncodedImage>> {
         let path = &job.path;
-        if !self.wait_for_disk(path) {
+        if self.wait_for_disk(path, true) == JobStatus::Cancelled {
             return Ok(None);
         }
         let mut file = File::open(path)?;
         let len = usize::try_from(file.metadata()?.len())?;
         let mut head = Vec::new();
-        if !self.read_range(path, &mut file, 0, len.min(HEAD_LEN), &mut head)? {
+        if self.read_range(path, &mut file, 0, len.min(HEAD_LEN), &mut head, true)?
+            == JobStatus::Cancelled
+        {
             return Ok(None);
         }
         if !tiff::has_tiff_magic(&head) {
             let offset = u64::try_from(head.len())?;
             let nr_left = len - head.len();
-            let is_complete = self.read_range(path, &mut file, offset, nr_left, &mut head)?;
-            return Ok(is_complete.then_some(Source {
+            let status = self.read_range(path, &mut file, offset, nr_left, &mut head, false)?;
+            return Ok((status == JobStatus::Continue).then_some(EncodedImage {
                 data: head,
                 orientation: None,
             }));
@@ -270,13 +323,14 @@ impl SharedLoader {
 
         let embedded = tiff::find_embedded(&head)?;
         if let Some(draft) = embedded.draft {
-            let Some(data) = self.read_span(path, &mut file, &head, draft)? else {
+            let draft = self.read_span(path, &mut file, &head, draft, true)?;
+            let Some(data) = draft else {
                 return Ok(None);
             };
             self.send_draft(job, &data, embedded.orientation);
         }
-        let data = self.read_span(path, &mut file, &head, embedded.full)?;
-        Ok(data.map(|data| Source {
+        let data = self.read_span(path, &mut file, &head, embedded.full, false)?;
+        Ok(data.map(|data| EncodedImage {
             data,
             orientation: Some(embedded.orientation),
         }))
@@ -284,8 +338,8 @@ impl SharedLoader {
 
     /// None means the job was abandoned because it is no longer wanted.
     fn run(&self, job: &LoadJob) -> Result<Option<PreparedImage>> {
-        let full = match &job.full {
-            Some(full) => Arc::clone(full),
+        let original = match &job.original {
+            Some(img) => Arc::clone(img),
             None => {
                 let source = self.read(job);
                 self.lister_gate
@@ -295,18 +349,18 @@ impl SharedLoader {
                 let Some(source) = source? else {
                     return Ok(None);
                 };
-                if !self.start_decoding(&job.path) {
+                if self.start_decoding(&job.path) == JobStatus::Cancelled {
                     return Ok(None);
                 }
                 Arc::new(decode::decode(&source.data, source.orientation)?)
             }
         };
-        let spec = job.spec;
-        let fit = decode::fit(&full, spec.w, spec.h, spec.upscale, spec.turns)?;
+        let fit_params = job.fit_params;
+        let fitted = decode::fit(&original, fit_params)?;
         Ok(Some(PreparedImage {
-            fit: Arc::new(fit),
-            size: full.upright_size(spec.turns),
-            full: Some(full),
+            fitted: Arc::new(fitted),
+            upright_size: original.upright_size(fit_params.turns),
+            original: Some(original),
             is_draft: false,
         }))
     }
@@ -355,7 +409,17 @@ impl Loader {
 
     pub fn set_jobs(&self, current: Option<LoadJob>, prefetch: Vec<LoadJob>) {
         let mut state = self.shared.lock();
-        state.current = current;
+        let LoadQueue {
+            current: current_slot,
+            in_flight,
+            ..
+        } = &mut *state;
+        *current_slot = current;
+        if let Some(current) = current_slot {
+            for job in in_flight.iter_mut().filter(|job| job.path == current.path) {
+                job.was_current = true;
+            }
+        }
         state.prefetch = prefetch;
         self.shared.wake.notify_all();
     }
