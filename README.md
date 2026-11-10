@@ -49,6 +49,7 @@ fela reads `%APPDATA%\fela\config.toml` on Windows, and
     prefetch_jump = true
     prefetch_inflight = 4
     cache_mb = 512
+    fullscreen = false
 
 ## Key handling
 

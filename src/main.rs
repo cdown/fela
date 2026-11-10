@@ -35,7 +35,6 @@ const WINDOW_SIZE: PhysicalSize<u32> = PhysicalSize::new(800, 600);
 // On Windows, drawing stalls while a new window takes focus. Create it without focus and wait
 // for the first load result or FOCUS_DEADLINE, then draw before asking for focus
 const FOCUS_AFTER_FIRST_IMAGE: bool = cfg!(windows);
-
 const FOCUS_DEADLINE: Duration = Duration::from_millis(50);
 
 #[derive(Parser, Debug)]
@@ -120,7 +119,7 @@ struct Viewer {
     is_bar_shown: bool,
     /// How far the last navigation moved, as a hint for where the next one will go.
     last_step: isize,
-    shown: Option<Arc<decode::RenderedImage>>,
+    shown_frame: Option<Arc<decode::RenderedImage>>,
     /// The images we were on since the current image was last on screen, oldest first.
     trail: Vec<usize>,
     view: view::View,
@@ -390,19 +389,19 @@ impl Viewer {
         let mut message = None;
         match self.cache.get(cur).map(|entry| &entry.result) {
             Some(Ok(ready)) => {
-                self.shown = Some(Arc::clone(&ready.fitted));
+                self.shown_frame = Some(Arc::clone(&ready.fitted));
                 if let (ScaleMode::Zoom(zoom), Some(original)) = (self.view.scale, &ready.original)
                 {
                     let img_size = original.upright_size(self.view.turns);
                     let region = self.view.region(zoom, img_size, self.area());
                     let turns = self.view.turns;
                     let frame = decode::render(original, turns, region.crop, region.w, region.h)?;
-                    self.shown = Some(Arc::new(frame));
+                    self.shown_frame = Some(Arc::new(frame));
                 }
                 self.trail.clear();
             }
             Some(Err(err)) => {
-                self.shown = None;
+                self.shown_frame = None;
                 self.trail.clear();
                 message = Some(err.clone());
             }
@@ -411,7 +410,7 @@ impl Viewer {
                 if let Some(nr) = self.trail.iter().rposition(is_ready) {
                     let idx = self.trail[nr];
                     if let Some(Ok(ready)) = self.cache.get(idx).map(|entry| &entry.result) {
-                        self.shown = Some(Arc::clone(&ready.fitted));
+                        self.shown_frame = Some(Arc::clone(&ready.fitted));
                     }
                     self.trail.drain(..=nr);
                 }
@@ -427,7 +426,7 @@ impl Viewer {
         surface.resize(w, h).map_err(|err| anyhow!("{err}"))?;
         let mut buf = surface.buffer_mut().map_err(|err| anyhow!("{err}"))?;
         let (area, bar) = buf.split_at_mut((buf_h - bar_h) * buf_w);
-        match &self.shown {
+        match &self.shown_frame {
             Some(frame) => view::draw(area, buf_w, buf_h - bar_h, frame),
             None => area.fill(0),
         }
@@ -671,14 +670,14 @@ fn main() -> Result<()> {
     let mut app = Viewer {
         cache: cache::ImageCache::new(cfg.cache_mb),
         loader: loader::Loader::new(cfg.prefetch_inflight, el.create_proxy(), gate_tx),
-        is_fullscreen: args.fullscreen,
+        is_fullscreen: args.fullscreen || cfg.fullscreen,
         args,
         cfg,
         files,
         size: PhysicalSize::default(),
         is_bar_shown: true,
         last_step: 1,
-        shown: None,
+        shown_frame: None,
         trail: Vec::new(),
         view: view::View::new(),
         key_prefix: None,
@@ -693,7 +692,6 @@ fn main() -> Result<()> {
         err: None,
     };
     el.run_app(&mut app)?;
-
     if app.args.stdout {
         let mut out = std::io::stdout().lock();
         for path in app.files.marked() {
