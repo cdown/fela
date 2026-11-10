@@ -22,3 +22,6 @@ softbuffer = { version = "0.4.8", features = ["x11", "x11-dlopen", "wayland", "w
 toml = { version = "1.1.8", features = ["std", "parse", "serde"], default-features = false }
 winit = { version = "0.30.13", features = ["rwh_06", "x11", "wayland", "wayland-dlopen"], default-features = false }
 zune-jpeg = { version = "0.5.15", features = ["std", "x86"], default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_Console"], default-features = false }

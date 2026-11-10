@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use softbuffer::Surface;
@@ -639,7 +641,18 @@ fn spawn_lister(args: Vec<PathBuf>, gate: Receiver<()>, proxy: EventLoopProxy<Vi
     });
 }
 
+#[cfg(windows)]
+fn attach_console() {
+    use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    // SAFETY: Simple FFI. It fails if we were not started from a console, which is fine.
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+}
+
+#[cfg(not(windows))]
+fn attach_console() {}
+
 fn main() -> Result<()> {
+    attach_console();
     let mut args = Args::parse();
     let cfg = config::load()?;
     let mut paths = std::mem::take(&mut args.paths);
