@@ -25,11 +25,11 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             jump: 10,
-            prefetch_ahead: 2,
+            prefetch_ahead: 4,
             prefetch_behind: 1,
             prefetch_jump: true,
-            prefetch_inflight: 2,
-            cache_mb: 1024,
+            prefetch_inflight: 4,
+            cache_mb: 512,
             handler: Vec::new(),
         }
     }
