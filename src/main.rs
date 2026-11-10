@@ -459,7 +459,6 @@ impl Viewer {
         let n = isize::try_from(count.unwrap_or(1)).unwrap_or(isize::MAX);
         let jump = isize::try_from(self.cfg.jump).unwrap_or(isize::MAX);
         let from = self.files.index();
-        let last = self.files.len().saturating_sub(1);
 
         let moved = match key.as_ref() {
             Key::Character("q") => {
@@ -543,7 +542,7 @@ impl Viewer {
             }
             Key::Character("G") => self
                 .files
-                .go_to(count.map_or(last, |c| c.saturating_sub(1))),
+                .go_to(count.map_or(usize::MAX, |c| c.saturating_sub(1))),
             Key::Character(c) => {
                 if let Some(digit) = c.parse::<usize>().ok().filter(|_| c.len() == 1) {
                     let count = count.unwrap_or(0).saturating_mul(10).saturating_add(digit);

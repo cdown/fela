@@ -8,6 +8,7 @@ pub struct FileList {
     cur: usize,
     marked: HashSet<PathBuf>,
     pub is_listing: bool,
+    pending_go_to: Option<usize>,
     pending_step: isize,
 }
 
@@ -79,6 +80,7 @@ impl FileList {
             cur: 0,
             marked: HashSet::new(),
             is_listing: true,
+            pending_go_to: None,
             pending_step: 0,
         }
     }
@@ -90,6 +92,9 @@ impl FileList {
         self.cur = cur.unwrap_or(0);
         self.list = list;
         self.is_listing = false;
+        if let Some(idx) = self.pending_go_to.take() {
+            self.go_to(idx);
+        }
         let pending_step = std::mem::take(&mut self.pending_step);
         self.step(pending_step);
     }
@@ -118,6 +123,11 @@ impl FileList {
     }
 
     pub fn go_to(&mut self, idx: usize) -> bool {
+        if self.is_listing {
+            self.pending_go_to = Some(idx);
+            self.pending_step = 0;
+            return false;
+        }
         let idx = idx.min(self.list.len().saturating_sub(1));
         let changed = idx != self.cur;
         self.cur = idx;
@@ -245,6 +255,17 @@ mod tests {
         assert!(!files.step(3));
         assert!(!files.step(-1));
         assert_eq!(files.current(), Some(&PathBuf::from("b.jpg")));
+        let list = ["a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg"];
+        files.set_list(list.iter().map(PathBuf::from).collect());
+        assert_eq!(files.current(), Some(&PathBuf::from("d.jpg")));
+    }
+
+    #[test]
+    fn test_go_to_while_listing_applies_afterwards() {
+        let mut files = FileList::new(&[PathBuf::from("b.jpg")]);
+        assert!(!files.step(1));
+        assert!(!files.go_to(usize::MAX));
+        assert!(!files.step(-1));
         let list = ["a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg"];
         files.set_list(list.iter().map(PathBuf::from).collect());
         assert_eq!(files.current(), Some(&PathBuf::from("d.jpg")));
