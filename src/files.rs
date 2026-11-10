@@ -12,6 +12,13 @@ pub struct FileList {
     pending_step: isize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Navigation {
+    Moved,
+    Unchanged,
+    Deferred,
+}
+
 fn has_image_ext(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -35,6 +42,7 @@ fn list_dir(dir: &Path) -> Vec<PathBuf> {
             return Vec::new();
         }
     };
+
     // DirEntry::path() would be the obvious choice, but we want paths relative to what the user
     // gave us, not to the "." we substituted above.
     let mut paths: Vec<_> = entries
@@ -122,22 +130,24 @@ impl FileList {
         self.list.get(self.cur)
     }
 
-    pub fn go_to(&mut self, idx: usize) -> bool {
+    pub fn go_to(&mut self, idx: usize) -> Navigation {
         if self.is_listing {
             self.pending_go_to = Some(idx);
             self.pending_step = 0;
-            return false;
+            return Navigation::Deferred;
         }
         let idx = idx.min(self.list.len().saturating_sub(1));
-        let changed = idx != self.cur;
+        if idx == self.cur {
+            return Navigation::Unchanged;
+        }
         self.cur = idx;
-        changed
+        Navigation::Moved
     }
 
-    pub fn step(&mut self, delta: isize) -> bool {
+    pub fn step(&mut self, delta: isize) -> Navigation {
         if self.is_listing {
             self.pending_step = self.pending_step.saturating_add(delta);
-            return false;
+            return Navigation::Deferred;
         }
         self.go_to(self.cur.saturating_add_signed(delta))
     }
@@ -167,7 +177,7 @@ impl FileList {
             .collect()
     }
 
-    pub fn step_marked(&mut self, n: isize) -> bool {
+    pub fn step_marked(&mut self, n: isize) -> Navigation {
         let marked = (0..self.list.len()).filter(|idx| self.is_marked(*idx));
         let nr_skipped = n.unsigned_abs().saturating_sub(1);
         let target = match n {
@@ -175,7 +185,10 @@ impl FileList {
             1.. => marked.filter(|idx| *idx > self.cur).nth(nr_skipped),
             _ => marked.filter(|idx| *idx < self.cur).rev().nth(nr_skipped),
         };
-        target.is_some_and(|idx| self.go_to(idx))
+        match target {
+            Some(idx) => self.go_to(idx),
+            None => Navigation::Unchanged,
+        }
     }
 
     pub fn remove(&mut self, paths: &[PathBuf]) {
@@ -210,15 +223,32 @@ mod tests {
     }
 
     #[test]
+    fn test_expand_args_lone_file_stands_for_its_directory() {
+        let dir = std::env::temp_dir().join(format!("fela-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["b.jpg", "a.png", "c.ARW", "notes.txt", "clip.mp4"] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        let images = [dir.join("a.png"), dir.join("b.jpg"), dir.join("c.ARW")];
+
+        assert_eq!(expand_args(&[dir.join("b.jpg")]), images);
+        assert_eq!(expand_args(std::slice::from_ref(&dir)), images);
+        let several = [dir.join("c.ARW"), dir.join("a.png")];
+        assert_eq!(expand_args(&several), several);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn test_step_marked() {
         let mut files = files(&["a", "b", "c", "d", "e"], 2);
         mark(&mut files, &[0, 1, 3, 4]);
-        assert!(files.step_marked(2));
+        assert_eq!(files.step_marked(2), Navigation::Moved);
         assert_eq!(files.index(), 4);
-        assert!(!files.step_marked(1));
-        assert!(files.step_marked(-3));
+        assert_eq!(files.step_marked(1), Navigation::Unchanged);
+        assert_eq!(files.step_marked(-3), Navigation::Moved);
         assert_eq!(files.index(), 0);
-        assert!(!files.step_marked(0));
+        assert_eq!(files.step_marked(0), Navigation::Unchanged);
     }
 
     #[test]
@@ -252,8 +282,8 @@ mod tests {
     #[test]
     fn test_steps_while_listing_apply_afterwards() {
         let mut files = FileList::new(&[PathBuf::from("b.jpg")]);
-        assert!(!files.step(3));
-        assert!(!files.step(-1));
+        assert_eq!(files.step(3), Navigation::Deferred);
+        assert_eq!(files.step(-1), Navigation::Deferred);
         assert_eq!(files.current(), Some(&PathBuf::from("b.jpg")));
         let list = ["a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg"];
         files.set_list(list.iter().map(PathBuf::from).collect());
@@ -263,9 +293,9 @@ mod tests {
     #[test]
     fn test_go_to_while_listing_applies_afterwards() {
         let mut files = FileList::new(&[PathBuf::from("b.jpg")]);
-        assert!(!files.step(1));
-        assert!(!files.go_to(usize::MAX));
-        assert!(!files.step(-1));
+        assert_eq!(files.step(1), Navigation::Deferred);
+        assert_eq!(files.go_to(usize::MAX), Navigation::Deferred);
+        assert_eq!(files.step(-1), Navigation::Deferred);
         let list = ["a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg"];
         files.set_list(list.iter().map(PathBuf::from).collect());
         assert_eq!(files.current(), Some(&PathBuf::from("d.jpg")));

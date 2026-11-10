@@ -25,6 +25,7 @@ mod loader;
 mod tiff;
 mod view;
 
+use files::Navigation;
 use view::{ScaleMode, ZoomStep};
 
 const WINDOW_SIZE: PhysicalSize<u32> = PhysicalSize::new(800, 600);
@@ -121,7 +122,7 @@ struct Viewer {
     /// The images we were on since the current image was last on screen, oldest first.
     trail: Vec<usize>,
     view: view::View,
-    count: Option<usize>,
+    key_prefix: Option<usize>,
     mods: ModifiersState,
     handler_state: HandlerState,
     notice: Option<String>,
@@ -455,16 +456,13 @@ impl Viewer {
             return self.request_redraw();
         }
 
-        let count = self.count.take();
-        let n = isize::try_from(count.unwrap_or(1)).unwrap_or(isize::MAX);
+        let key_prefix = self.key_prefix.take();
+        let n = isize::try_from(key_prefix.unwrap_or(1)).unwrap_or(isize::MAX);
         let jump = isize::try_from(self.cfg.jump).unwrap_or(isize::MAX);
         let from = self.files.index();
 
-        let moved = match key.as_ref() {
-            Key::Character("q") => {
-                el.exit();
-                false
-            }
+        let navigation = match key.as_ref() {
+            Key::Character("q") => return el.exit(),
             Key::Character("n") | Key::Named(NamedKey::Space) => self.files.step(n),
             Key::Character("p") | Key::Named(NamedKey::Backspace) => self.files.step(-n),
             Key::Character("]") => self.files.step(n.saturating_mul(jump)),
@@ -474,85 +472,61 @@ impl Viewer {
             Key::Character("P") => self.files.step_marked(n.saturating_neg()),
             Key::Character("m") => {
                 self.files.toggle_mark();
-                self.request_redraw();
-                false
+                return self.request_redraw();
             }
             Key::Character("D") => {
                 let current: Vec<_> = self.files.current().cloned().into_iter().collect();
-                self.remove_files(el, &current);
-                false
+                return self.remove_files(el, &current);
             }
             Key::Character("r") => {
                 self.cache.remove(from);
-                self.refresh();
-                false
+                return self.refresh();
             }
-            Key::Character("+") => {
-                self.step_zoom(ZoomStep::In);
-                false
-            }
-            Key::Character("-") => {
-                self.step_zoom(ZoomStep::Out);
-                false
-            }
+            Key::Character("+") => return self.step_zoom(ZoomStep::In),
+            Key::Character("-") => return self.step_zoom(ZoomStep::Out),
             Key::Character("=") => {
-                self.set_scale(ScaleMode::Zoom(count.map_or(1.0, |c| c as f64 / 100.0)));
-                false
+                return self.set_scale(ScaleMode::Zoom(
+                    key_prefix.map_or(1.0, |c| c as f64 / 100.0),
+                ));
             }
-            Key::Character("w") => {
-                self.set_scale(ScaleMode::ShrinkToFit);
-                false
-            }
-            Key::Character("W") => {
-                self.set_scale(ScaleMode::Fit);
-                false
-            }
+            Key::Character("w") => return self.set_scale(ScaleMode::ShrinkToFit),
+            Key::Character("W") => return self.set_scale(ScaleMode::Fit),
             Key::Character("h") | Key::Named(NamedKey::ArrowLeft) => {
-                self.pan((-1.0, 0.0), count);
-                false
+                return self.pan((-1.0, 0.0), key_prefix);
             }
             Key::Character("l") | Key::Named(NamedKey::ArrowRight) => {
-                self.pan((1.0, 0.0), count);
-                false
+                return self.pan((1.0, 0.0), key_prefix);
             }
             Key::Character("k") | Key::Named(NamedKey::ArrowUp) => {
-                self.pan((0.0, -1.0), count);
-                false
+                return self.pan((0.0, -1.0), key_prefix);
             }
             Key::Character("j") | Key::Named(NamedKey::ArrowDown) => {
-                self.pan((0.0, 1.0), count);
-                false
+                return self.pan((0.0, 1.0), key_prefix);
             }
-            Key::Character("<") => {
-                self.rotate(3);
-                false
-            }
-            Key::Character(">") => {
-                self.rotate(1);
-                false
-            }
+            Key::Character("<") => return self.rotate(3),
+            Key::Character(">") => return self.rotate(1),
             Key::Character("b") => {
                 self.is_bar_shown = !self.is_bar_shown;
-                self.refresh();
-                false
+                return self.refresh();
             }
-            Key::Character("f") => {
-                self.toggle_fullscreen();
-                false
-            }
+            Key::Character("f") => return self.toggle_fullscreen(),
             Key::Character("G") => self
                 .files
-                .go_to(count.map_or(usize::MAX, |c| c.saturating_sub(1))),
+                .go_to(key_prefix.map_or(usize::MAX, |c| c.saturating_sub(1))),
             Key::Character(c) => {
                 if let Some(digit) = c.parse::<usize>().ok().filter(|_| c.len() == 1) {
-                    let count = count.unwrap_or(0).saturating_mul(10).saturating_add(digit);
-                    self.count = Some(count);
+                    self.key_prefix = Some(
+                        key_prefix
+                            .unwrap_or(0)
+                            .saturating_mul(10)
+                            .saturating_add(digit),
+                    );
                 }
-                false
+                return;
             }
-            _ => false,
+            _ => return,
         };
-        if moved {
+        if navigation == Navigation::Moved {
             let to = self.files.index();
             self.last_step = if to > from {
                 isize::try_from(to - from).unwrap_or(isize::MAX)
@@ -694,7 +668,7 @@ fn main() -> Result<()> {
         shown: None,
         trail: Vec::new(),
         view: view::View::new(),
-        count: None,
+        key_prefix: None,
         mods: ModifiersState::empty(),
         handler_state: HandlerState::Idle,
         notice: None,
