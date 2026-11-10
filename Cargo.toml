@@ -5,6 +5,7 @@ edition = "2021"
 authors = ["Chris Down <chris@chrisdown.name>"]
 description = "A fast, keyboard-driven image viewer."
 repository = "https://github.com/cdown/fela"
+readme = "README.md"
 keywords = ["image", "viewer", "raw", "arw", "nsxiv"]
 categories = ["multimedia::images"]
 license = "MIT"
