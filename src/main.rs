@@ -30,6 +30,26 @@ mod view;
 use files::Navigation;
 use view::{ScaleMode, ZoomStep};
 
+fn render_frame(
+    ready: &cache::CachedImage,
+    view: &view::View,
+    area: (u32, u32),
+) -> Result<Option<Arc<decode::RenderedImage>>> {
+    let ScaleMode::Zoom(zoom) = view.scale else {
+        return Ok(Some(Arc::clone(&ready.fitted)));
+    };
+    let Some(original) = &ready.original else {
+        return Ok(None);
+    };
+    if area.0 == 0 || area.1 == 0 {
+        return Ok(None);
+    }
+    let img = original.upright_size(view.turns);
+    let region = view.region(zoom, img, area);
+    let frame = decode::render(original, view.turns, region.crop, region.w, region.h)?;
+    Ok(Some(Arc::new(frame)))
+}
+
 const WINDOW_SIZE: PhysicalSize<u32> = PhysicalSize::new(800, 600);
 
 // On Windows, drawing stalls while a new window takes focus. Create it without focus and wait
@@ -200,8 +220,20 @@ impl Viewer {
     }
 
     fn pan(&mut self, dir: (f64, f64), nr_px: Option<usize>) {
-        self.view.pan_by(dir, nr_px, self.area());
-        self.request_redraw();
+        let Some(original) = self
+            .cache
+            .get(self.files.index())
+            .and_then(|entry| entry.result.as_ref().ok())
+            .and_then(|ready| ready.original.as_ref())
+        else {
+            return;
+        };
+        let area = self.area();
+        if area.0 > 0 && area.1 > 0 {
+            let img = original.upright_size(self.view.turns);
+            self.view.pan_by(dir, nr_px, img, area);
+            self.request_redraw();
+        }
     }
 
     fn rotate(&mut self, turns: u8) {
@@ -224,11 +256,12 @@ impl Viewer {
         let mark = if self.files.is_marked(cur) { "* " } else { "" };
         let state = if self.files.is_listing {
             "listing "
-        } else if self
-            .cache
-            .get(cur)
-            .is_none_or(cache::ImageCacheEntry::is_draft)
-        {
+        } else if self.cache.get(cur).is_none_or(|entry| {
+            entry.result.as_ref().is_ok_and(|ready| {
+                ready.is_draft
+                    || (matches!(self.view.scale, ScaleMode::Zoom(_)) && ready.original.is_none())
+            })
+        }) {
             "loading "
         } else {
             ""
@@ -389,24 +422,17 @@ impl Viewer {
         let mut message = None;
         match self.cache.get(cur).map(|entry| &entry.result) {
             Some(Ok(ready)) => {
-                self.shown_frame = Some(Arc::clone(&ready.fitted));
-                if let (ScaleMode::Zoom(zoom), Some(original), area @ (_, 1..)) =
-                    (self.view.scale, &ready.original, self.area())
-                {
-                    let img_size = original.upright_size(self.view.turns);
-                    let region = self.view.region(zoom, img_size, area);
-                    let turns = self.view.turns;
-                    let frame = decode::render(original, turns, region.crop, region.w, region.h)?;
-                    self.shown_frame = Some(Arc::new(frame));
+                if let Some(frame) = render_frame(ready, &self.view, self.area())? {
+                    self.shown_frame = Some(frame);
+                    self.trail.clear();
                 }
-                self.trail.clear();
             }
             Some(Err(err)) => {
                 self.shown_frame = None;
                 self.trail.clear();
                 message = Some(err.clone());
             }
-            None => {
+            None if !matches!(self.view.scale, ScaleMode::Zoom(_)) => {
                 let is_ready = |idx: &usize| self.cache.get(*idx).is_some_and(|e| e.result.is_ok());
                 if let Some(nr) = self.trail.iter().rposition(is_ready) {
                     let idx = self.trail[nr];
@@ -416,6 +442,7 @@ impl Viewer {
                     self.trail.drain(..=nr);
                 }
             }
+            None => {}
         }
         let (left, right) = self.status();
 
@@ -543,8 +570,14 @@ impl Viewer {
             } else {
                 isize::try_from(from - to).map_or(isize::MIN, |step| -step)
             };
-            self.trail.push(from);
-            self.reset_view();
+            if matches!(self.view.scale, ScaleMode::Zoom(_)) {
+                self.trail.clear();
+            } else {
+                self.trail.push(from);
+                self.view.pan = (0.0, 0.0);
+            }
+            self.view.turns = 0;
+            self.refresh();
         }
     }
 
@@ -708,4 +741,44 @@ fn main() -> Result<()> {
         }
     }
     app.err.map_or(Ok(()), Err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_zoom_waits_for_original() {
+        let fitted = Arc::new(decode::RenderedImage {
+            w: 1,
+            h: 1,
+            px: vec![0],
+        });
+        let mut ready = cache::CachedImage {
+            fitted: Arc::clone(&fitted),
+            original: None,
+            upright_size: (4, 4),
+            is_draft: true,
+        };
+        let mut view = view::View::new();
+        let area = (2, 2);
+        assert!(Arc::ptr_eq(
+            &render_frame(&ready, &view, area).unwrap().unwrap(),
+            &fitted,
+        ));
+
+        view.scale = ScaleMode::Zoom(1.0);
+        assert!(render_frame(&ready, &view, area).unwrap().is_none());
+        ready.is_draft = false;
+        assert!(render_frame(&ready, &view, area).unwrap().is_none());
+
+        ready.original = Some(Arc::new(decode::DecodedImage {
+            w: 4,
+            h: 4,
+            px: vec![0; 4 * 4 * 3],
+            turns: 0,
+        }));
+        let frame = render_frame(&ready, &view, area).unwrap().unwrap();
+        assert_eq!((frame.w, frame.h), area);
+    }
 }

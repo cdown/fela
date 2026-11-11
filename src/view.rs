@@ -50,32 +50,49 @@ impl View {
         self.scale = ScaleMode::Zoom(next);
     }
 
-    pub fn pan_by(&mut self, dir: (f64, f64), nr_px: Option<usize>, win: (u32, u32)) {
+    pub fn pan_by(
+        &mut self,
+        dir: (f64, f64),
+        nr_px: Option<usize>,
+        img: (u32, u32),
+        win: (u32, u32),
+    ) {
         let ScaleMode::Zoom(zoom) = self.scale else {
             return;
         };
-        let step = |win: u32| nr_px.map_or(f64::from(win) * PAN_FRACTION, |nr| nr as f64) / zoom;
-        self.pan.0 += dir.0 * step(win.0);
-        self.pan.1 += dir.1 * step(win.1);
+        let pan_axis = |pan: &mut f64, dir: f64, img: u32, win: u32| {
+            if dir == 0.0 {
+                return;
+            }
+            let (_, _, max_pan) = axis_geometry(zoom, img, win);
+            let step = nr_px.map_or(f64::from(win) * PAN_FRACTION, |nr| nr as f64) / zoom;
+            *pan = (pan.clamp(-max_pan, max_pan) + dir * step).clamp(-max_pan, max_pan);
+        };
+        pan_axis(&mut self.pan.0, dir.0, img.0, win.0);
+        pan_axis(&mut self.pan.1, dir.1, img.1, win.1);
     }
 
-    pub fn region(&mut self, zoom: f64, img: (u32, u32), win: (u32, u32)) -> Viewport {
-        let axis = |img: u32, win: u32, pan: &mut f64| {
-            let img = f64::from(img);
-            let nr_shown = (img * zoom).round().clamp(1.0, f64::from(win));
-            let len = (nr_shown / zoom).min(img);
-            let max_pan = (img - len) / 2.0;
-            *pan = pan.clamp(-max_pan, max_pan);
-            (img / 2.0 + *pan - len / 2.0, len, nr_shown as u32)
+    pub fn region(&self, zoom: f64, img: (u32, u32), win: (u32, u32)) -> Viewport {
+        let axis = |img, win, pan: f64| {
+            let (len, nr_shown, max_pan) = axis_geometry(zoom, img, win);
+            let pan = pan.clamp(-max_pan, max_pan);
+            (f64::from(img) / 2.0 + pan - len / 2.0, len, nr_shown)
         };
-        let (x, w, out_w) = axis(img.0, win.0, &mut self.pan.0);
-        let (y, h, out_h) = axis(img.1, win.1, &mut self.pan.1);
+        let (x, w, out_w) = axis(img.0, win.0, self.pan.0);
+        let (y, h, out_h) = axis(img.1, win.1, self.pan.1);
         Viewport {
             crop: ImageRect { x, y, w, h },
             w: out_w,
             h: out_h,
         }
     }
+}
+
+fn axis_geometry(zoom: f64, img: u32, win: u32) -> (f64, u32, f64) {
+    let img = f64::from(img);
+    let nr_shown = (img * zoom).round().clamp(1.0, f64::from(win));
+    let len = (nr_shown / zoom).min(img);
+    (len, nr_shown as u32, (img - len) / 2.0)
 }
 
 pub fn draw(buf: &mut [u32], buf_w: usize, buf_h: usize, frame: &RenderedImage) {
@@ -118,7 +135,7 @@ mod tests {
 
     #[test]
     fn test_region_pan_is_clamped() {
-        let mut view = view_with_pan((1e9, -1e9));
+        let view = view_with_pan((1e9, -1e9));
         let region = view.region(2.0, (1000, 1000), (500, 500));
         let expected = ImageRect {
             x: 750.0,
@@ -127,12 +144,13 @@ mod tests {
             h: 250.0,
         };
         assert_eq!(region.crop, expected);
-        assert_eq!(view.pan, (375.0, -375.0));
+        assert_eq!(view.pan, (1e9, -1e9));
     }
 
     #[test]
     fn test_region_small_image_is_not_panned() {
-        let region = view_with_pan((50.0, 0.0)).region(1.0, (100, 80), (800, 600));
+        let view = view_with_pan((50.0, 0.0));
+        let region = view.region(1.0, (100, 80), (800, 600));
         let expected = ImageRect {
             x: 0.0,
             y: 0.0,
@@ -141,6 +159,16 @@ mod tests {
         };
         assert_eq!(region.crop, expected);
         assert_eq!((region.w, region.h), (100, 80));
+        assert_eq!(view.region(1.0, (1000, 800), (800, 600)).crop.x, 150.0);
+    }
+
+    #[test]
+    fn test_pan_moves_inward_from_clamped_edge() {
+        let mut view = view_with_pan((400.0, 400.0));
+        view.scale = ScaleMode::Zoom(1.0);
+        view.pan_by((-1.0, 0.0), Some(10), (300, 300), (200, 200));
+        assert_eq!(view.pan, (40.0, 400.0));
+        assert_eq!(view.region(1.0, (300, 300), (200, 200)).crop.x, 90.0);
     }
 
     #[test]
