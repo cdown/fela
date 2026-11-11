@@ -26,7 +26,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            jump: 10,
+            jump: 5,
             prefetch_ahead: 4,
             prefetch_behind: 1,
             prefetch_jump: true,

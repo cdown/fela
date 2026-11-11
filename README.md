@@ -44,7 +44,7 @@ images forward.
 fela reads `%APPDATA%\fela\config.toml` on Windows, and
 `$XDG_CONFIG_HOME/fela/config.toml` on Linux. These are the defaults:
 
-    jump = 10
+    jump = 5
     prefetch_ahead = 4
     prefetch_behind = 1
     prefetch_jump = true
