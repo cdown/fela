@@ -162,6 +162,8 @@ fn scale_rows(
     let nr_rows = out.len() / w as usize;
     let src_rows_per_row = src.h / f64::from(h);
     let top = src.top + first_row as f64 * src_rows_per_row;
+    // Rounding can put the last band's bottom just past the image edge.
+    let height = (nr_rows as f64 * src_rows_per_row).min(f64::from(img.h) - top);
     let from = fr::images::ImageRef::new(img.w, img.h, &img.px, fr::PixelType::U8x3)?;
     let mut to = fr::images::Image::new(w, u32::try_from(nr_rows)?, fr::PixelType::U8x3);
     let filter = if f64::from(w) < src.w {
@@ -170,7 +172,7 @@ fn scale_rows(
         fr::FilterType::Bilinear
     };
     let opts = fr::ResizeOptions::new()
-        .crop(src.left, top, src.w, nr_rows as f64 * src_rows_per_row)
+        .crop(src.left, top, src.w, height)
         .resize_alg(fr::ResizeAlg::Convolution(filter))
         .use_alpha(false);
     fr::Resizer::new().resize(&from, &mut to, &opts)?;
@@ -278,6 +280,24 @@ fn rotate(frame: RenderedImage, turns: u8) -> RenderedImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_scale_in_bands_stays_inside_image() {
+        let img = DecodedImage {
+            w: 8,
+            h: 3744,
+            px: vec![0; 8 * 3744 * 3],
+            turns: 0,
+        };
+        let crop = ImageRect {
+            x: 0.0,
+            y: 0.0,
+            w: 8.0,
+            h: 3744.0,
+        };
+        let rendered = render(&img, 0, crop, 4, 1580).unwrap();
+        assert_eq!((rendered.w, rendered.h), (4, 1580));
+    }
 
     #[test]
     fn test_scale_in_bands_matches_scaling_at_once() {
