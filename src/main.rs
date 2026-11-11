@@ -594,7 +594,8 @@ impl Viewer {
         };
         let cur = self.files.index();
         self.cache.insert(idx, loaded);
-        self.cache.trim(cur);
+        let needs_original = matches!(self.view.scale, ScaleMode::Zoom(_));
+        self.cache.trim(cur, needs_original);
         self.schedule();
         if idx == cur || self.cache.get(cur).is_none() {
             self.request_redraw();
