@@ -25,7 +25,7 @@ quickly, including on slow disks and network paths.
 | `w`, `W`                | Fit large images to the window, fit all images       |
 | `h` `j` `k` `l`, arrows | Pan when zoomed in                                   |
 | `<`, `>`                | Rotate                                               |
-| `m`                     | Mark or unmark                                       |
+| `m`, `M`                | Mark, unmark                                         |
 | `N`, `P`                | Next and previous marked image                       |
 | Ctrl-u                  | Remove all marks                                     |
 | `D`                     | Drop the image from the list                         |

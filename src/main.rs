@@ -472,7 +472,11 @@ impl Viewer {
             Key::Character("N") => self.files.step_marked(n),
             Key::Character("P") => self.files.step_marked(n.saturating_neg()),
             Key::Character("m") => {
-                self.files.toggle_mark();
+                self.files.mark();
+                return self.request_redraw();
+            }
+            Key::Character("M") => {
+                self.files.unmark();
                 return self.request_redraw();
             }
             Key::Character("D") => {

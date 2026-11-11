@@ -156,12 +156,15 @@ impl FileList {
         self.get(idx).is_some_and(|path| self.marked.contains(path))
     }
 
-    pub fn toggle_mark(&mut self) {
-        let Some(path) = self.current().cloned() else {
-            return;
-        };
-        if !self.marked.remove(&path) {
+    pub fn mark(&mut self) {
+        if let Some(path) = self.current().cloned() {
             self.marked.insert(path);
+        }
+    }
+
+    pub fn unmark(&mut self) {
+        if let Some(path) = self.list.get(self.cur) {
+            self.marked.remove(path);
         }
     }
 
@@ -217,7 +220,7 @@ mod tests {
         let cur = files.index();
         for idx in idxs {
             files.go_to(*idx);
-            files.toggle_mark();
+            files.mark();
         }
         files.go_to(cur);
     }
@@ -237,6 +240,17 @@ mod tests {
         assert_eq!(expand_args(&several), several);
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_mark_and_unmark_are_idempotent() {
+        let mut files = files(&["a"], 0);
+        files.mark();
+        files.mark();
+        assert!(files.is_marked(0));
+        files.unmark();
+        files.unmark();
+        assert!(!files.is_marked(0));
     }
 
     #[test]
