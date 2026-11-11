@@ -394,7 +394,7 @@ dependencies = [
  "anyhow",
  "clap",
  "fast_image_resize",
- "font8x8",
+ "noto-sans-mono-bitmap",
  "png",
  "serde",
  "softbuffer",
@@ -420,12 +420,6 @@ dependencies = [
  "miniz_oxide 0.9.1",
  "zlib-rs",
 ]
-
-[[package]]
-name = "font8x8"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "875488b8711a968268c7cf5d139578713097ca4635a76044e8fe8eedf831d07e"
 
 [[package]]
 name = "foreign-types"
@@ -734,6 +728,12 @@ checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
 ]
+
+[[package]]
+name = "noto-sans-mono-bitmap"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09b7b72dee69e4110d1b91fb8d497c1b74a54082da5738dff84136142c4f767b"
 
 [[package]]
 name = "num-traits"

@@ -390,10 +390,11 @@ impl Viewer {
         match self.cache.get(cur).map(|entry| &entry.result) {
             Some(Ok(ready)) => {
                 self.shown_frame = Some(Arc::clone(&ready.fitted));
-                if let (ScaleMode::Zoom(zoom), Some(original)) = (self.view.scale, &ready.original)
+                if let (ScaleMode::Zoom(zoom), Some(original), area @ (_, 1..)) =
+                    (self.view.scale, &ready.original, self.area())
                 {
                     let img_size = original.upright_size(self.view.turns);
-                    let region = self.view.region(zoom, img_size, self.area());
+                    let region = self.view.region(zoom, img_size, area);
                     let turns = self.view.turns;
                     let frame = decode::render(original, turns, region.crop, region.w, region.h)?;
                     self.shown_frame = Some(Arc::new(frame));
