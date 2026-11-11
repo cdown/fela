@@ -24,6 +24,7 @@ quickly, including on slow disks and network paths.
 | `=`                     | One image pixel per screen pixel, or *count* percent |
 | `w`, `W`                | Fit large images to the window, fit all images       |
 | `h` `j` `k` `l`, arrows | Pan when zoomed in                                   |
+| `s`                     | Toggle sharpness checking                            |
 | `<`, `>`                | Rotate                                               |
 | `m`, `M`                | Mark, unmark                                         |
 | `N`, `P`                | Next and previous marked image                       |

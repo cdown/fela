@@ -24,6 +24,7 @@ mod decode;
 mod files;
 mod key_handler;
 mod loader;
+mod sharpness;
 mod tiff;
 mod view;
 
@@ -242,7 +243,7 @@ impl Viewer {
         self.refresh();
     }
 
-    fn status(&self) -> (String, String) {
+    fn status(&self, detail: Option<f64>) -> (String, String) {
         let cur = self.files.index();
         let left = match (&self.notice, self.handler_state) {
             (Some(notice), _) => notice.clone(),
@@ -269,10 +270,15 @@ impl Viewer {
         let zoom = self
             .zoom()
             .map_or(String::new(), |zoom| format!("{:.0}% ", zoom * 100.0));
+        let sharpness = match detail {
+            Some(detail) if state.is_empty() => format!("detail {detail:.2} "),
+            _ if self.view.is_sharpness_shown => "sharpness ".into(),
+            _ => String::new(),
+        };
         let nr = if self.files.len() == 0 { 0 } else { cur + 1 };
         (
             left,
-            format!("{state}{mark}{zoom}{nr}/{}", self.files.len()),
+            format!("{state}{mark}{sharpness}{zoom}{nr}/{}", self.files.len()),
         )
     }
 
@@ -444,7 +450,12 @@ impl Viewer {
             }
             None => {}
         }
-        let (left, right) = self.status();
+        let sharpness = self
+            .shown_frame
+            .as_ref()
+            .filter(|_| self.view.is_sharpness_shown)
+            .map(|frame| sharpness::render(frame));
+        let (left, right) = self.status(sharpness.as_ref().and_then(|(_, detail)| *detail));
 
         let (buf_w, buf_h) = (size.width as usize, size.height as usize);
         let bar_h = self.bar_height().min(buf_h);
@@ -454,7 +465,11 @@ impl Viewer {
         surface.resize(w, h).map_err(|err| anyhow!("{err}"))?;
         let mut buf = surface.buffer_mut().map_err(|err| anyhow!("{err}"))?;
         let (area, bar) = buf.split_at_mut((buf_h - bar_h) * buf_w);
-        match &self.shown_frame {
+        let frame = sharpness
+            .as_ref()
+            .map(|(frame, _)| frame)
+            .or(self.shown_frame.as_deref());
+        match frame {
             Some(frame) => view::draw(area, buf_w, buf_h - bar_h, frame),
             None => area.fill(0),
         }
@@ -518,6 +533,10 @@ impl Viewer {
             Key::Character("r") => {
                 self.cache.remove(from);
                 return self.refresh();
+            }
+            Key::Character("s") => {
+                self.view.is_sharpness_shown = !self.view.is_sharpness_shown;
+                return self.request_redraw();
             }
             Key::Character("+") => return self.step_zoom(ZoomStep::In),
             Key::Character("-") => return self.step_zoom(ZoomStep::Out),
@@ -650,7 +669,9 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
         match event {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
-                self.on_key(el, &event.logical_key);
+                if !event.repeat || event.logical_key.as_ref() != Key::Character("s") {
+                    self.on_key(el, &event.logical_key);
+                }
             }
             WindowEvent::ModifiersChanged(mods) => self.mods = mods.state(),
             WindowEvent::Resized(_) | WindowEvent::RedrawRequested => self.request_redraw(),

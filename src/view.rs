@@ -21,6 +21,7 @@ pub enum ZoomStep {
 
 pub struct View {
     pub scale: ScaleMode,
+    pub is_sharpness_shown: bool,
     /// How far the middle of the window is from the middle of the image, in image pixels.
     pub pan: (f64, f64),
     pub turns: u8,
@@ -36,6 +37,7 @@ impl View {
     pub fn new() -> Self {
         Self {
             scale: ScaleMode::ShrinkToFit,
+            is_sharpness_shown: false,
             pan: (0.0, 0.0),
             turns: 0,
         }
@@ -76,7 +78,9 @@ impl View {
         let axis = |img, win, pan: f64| {
             let (len, nr_shown, max_pan) = axis_geometry(zoom, img, win);
             let pan = pan.clamp(-max_pan, max_pan);
-            (f64::from(img) / 2.0 + pan - len / 2.0, len, nr_shown)
+            let start = (f64::from(img) - len) / 2.0 + pan;
+            let start = if zoom == 1.0 { start.round() } else { start };
+            (start, len, nr_shown)
         };
         let (x, w, out_w) = axis(img.0, win.0, self.pan.0);
         let (y, h, out_h) = axis(img.1, win.1, self.pan.1);
@@ -131,6 +135,13 @@ mod tests {
         };
         assert_eq!(region.crop, expected);
         assert_eq!((region.w, region.h), (2560, 1600));
+    }
+
+    #[test]
+    fn test_region_at_one_to_one_does_not_interpolate() {
+        let view = view_with_pan((0.0, 0.25));
+        let crop = view.region(1.0, (601, 403), (300, 200)).crop;
+        assert_eq!((crop.x, crop.y), (151.0, 102.0));
     }
 
     #[test]
