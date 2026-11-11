@@ -156,6 +156,10 @@ impl FileList {
         self.get(idx).is_some_and(|path| self.marked.contains(path))
     }
 
+    pub fn has_marks(&self) -> bool {
+        !self.marked.is_empty()
+    }
+
     pub fn mark(&mut self) {
         if let Some(path) = self.current().cloned() {
             self.marked.insert(path);

@@ -33,7 +33,8 @@ quickly, including on slow disks and network paths.
 | `b`                     | Toggle the status bar                                |
 | `f`                     | Toggle fullscreen                                    |
 | Ctrl-x                  | Send the next key to the key handler                 |
-| `q`                     | Quit                                                 |
+| `q`                     | Quit if no files are marked                          |
+| `Q`                     | Quit even with marked files                         |
 
 Most keys take a vim-style count typed before them. For example, `5n` goes five
 images forward.

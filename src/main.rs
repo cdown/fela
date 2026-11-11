@@ -463,7 +463,11 @@ impl Viewer {
         let from = self.files.index();
 
         let navigation = match key.as_ref() {
-            Key::Character("q") => return el.exit(),
+            Key::Character("q") if self.files.has_marks() => {
+                self.notice = Some("files are marked, press Q to quit".into());
+                return self.request_redraw();
+            }
+            Key::Character("q" | "Q") => return el.exit(),
             Key::Character("n") | Key::Named(NamedKey::Space) => self.files.step(n),
             Key::Character("p") | Key::Named(NamedKey::Backspace) => self.files.step(-n),
             Key::Character("]") => self.files.step(n.saturating_mul(jump)),
