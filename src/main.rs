@@ -148,6 +148,7 @@ struct Viewer {
     mods: ModifiersState,
     handler_state: HandlerState,
     notice: Option<String>,
+    clipboard: Option<arboard::Clipboard>,
     proxy: EventLoopProxy<ViewerEvent>,
     needs_redraw: bool,
     /// Set while we still have to draw the first frame and take focus, which waits for the first
@@ -484,6 +485,27 @@ impl Viewer {
         Ok(())
     }
 
+    fn copy_filenames(&mut self, marked: bool) -> Result<()> {
+        let paths = if marked {
+            self.files.marked()
+        } else {
+            self.files.current().cloned().into_iter().collect()
+        };
+        let names: Vec<_> = paths
+            .iter()
+            .filter_map(|path| path.file_name())
+            .map(|name| name.to_string_lossy())
+            .collect();
+        anyhow::ensure!(!names.is_empty(), "no filenames to copy");
+        let clipboard = match &mut self.clipboard {
+            Some(clipboard) => clipboard,
+            slot => slot.insert(arboard::Clipboard::new()?),
+        };
+        clipboard.set_text(names.join("\n"))?;
+        self.notice = Some(format!("copied {} filename(s)", names.len()));
+        Ok(())
+    }
+
     fn on_key(&mut self, el: &ActiveEventLoop, key: &Key) {
         self.notice = None;
         match self.handler_state {
@@ -518,6 +540,12 @@ impl Viewer {
             Key::Character("g") => self.files.go_to(0),
             Key::Character("N") => self.files.step_marked(n),
             Key::Character("P") => self.files.step_marked(n.saturating_neg()),
+            Key::Character("c" | "C") => {
+                if let Err(err) = self.copy_filenames(key.as_ref() == Key::Character("C")) {
+                    self.notice = Some(format!("clipboard: {err}"));
+                }
+                return self.request_redraw();
+            }
             Key::Character("m") => {
                 self.files.mark();
                 return self.request_redraw();
@@ -748,6 +776,7 @@ fn main() -> Result<()> {
         mods: ModifiersState::empty(),
         handler_state: HandlerState::Idle,
         notice: None,
+        clipboard: None,
         proxy: el.create_proxy(),
         needs_redraw: false,
         focus_by: None,

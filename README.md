@@ -28,6 +28,7 @@ quickly, including on slow disks and network paths.
 | `<`, `>`                | Rotate                                               |
 | `m`, `M`                | Mark, unmark                                         |
 | `N`, `P`                | Next and previous marked image                       |
+| `c`, `C`                | Copy current or marked filenames to the clipboard    |
 | Ctrl-u                  | Remove all marks                                     |
 | `D`                     | Drop the image from the list                         |
 | `r`                     | Reload                                               |
@@ -39,6 +40,9 @@ quickly, including on slow disks and network paths.
 
 Most keys take a vim-style count typed before them. For example, `5n` goes five
 images forward.
+
+`C` copies one filename per line in image list order. Both copy keys include
+the extension and omit the directory.
 
 ## Configuration
 
