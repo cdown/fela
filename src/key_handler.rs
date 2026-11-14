@@ -1,16 +1,17 @@
 use crate::ViewerEvent;
-use anyhow::{Context, Result};
-use std::io::Write;
+use anyhow::{ensure, Context, Result};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::SystemTime;
 use winit::event_loop::EventLoopProxy;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 #[derive(Debug, Default)]
-pub struct HandlerChanges {
+pub struct HandlerOutcome {
     pub gone: Vec<PathBuf>,
     pub changed: Vec<PathBuf>,
+    pub err: Option<anyhow::Error>,
 }
 
 pub fn key_name(key: &Key, mods: ModifiersState) -> Option<String> {
@@ -66,27 +67,38 @@ fn hide_console(cmd: &mut Command) {
 #[cfg(not(windows))]
 fn hide_console(_: &mut Command) {}
 
-fn run(argv: &[String], key: &str, paths: &[PathBuf]) -> Result<HandlerChanges> {
+fn finish(mut child: Child, paths: &[PathBuf]) -> Result<()> {
+    let mut stdin = child.stdin.take().expect("BUG: handler has no stdin");
+    let input = paths
+        .iter()
+        .try_for_each(|path| write_path(&mut stdin, path));
+    drop(stdin);
+
+    let status = child.wait().context("failed to wait for handler")?;
+    ensure!(status.success(), "{status}");
+
+    match input {
+        // A handler is free to not read its input
+        Err(err) if err.kind() == ErrorKind::BrokenPipe => Ok(()),
+        res => res.context("failed to send paths"),
+    }
+}
+
+fn run(argv: &[String], key: &str, paths: &[PathBuf]) -> Result<HandlerOutcome> {
     let (program, args) = argv.split_first().context("no key handler configured")?;
     let before: Vec<_> = paths.iter().map(|path| modified(path)).collect();
 
     let mut cmd = Command::new(program);
     cmd.args(args).arg(key).stdin(Stdio::piped());
     hide_console(&mut cmd);
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .with_context(|| format!("failed to run {program}"))?;
-    let mut stdin = child.stdin.take().context("BUG: handler has no stdin")?;
-    for path in paths {
-        // A handler is free to not read its input, in which case this fails with a broken pipe
-        if write_path(&mut stdin, path).is_err() {
-            break;
-        }
-    }
-    drop(stdin);
-    child.wait()?;
 
-    let mut outcome = HandlerChanges::default();
+    let mut outcome = HandlerOutcome {
+        err: finish(child, paths).err(),
+        ..HandlerOutcome::default()
+    };
     for (path, before) in paths.iter().zip(before) {
         match modified(path) {
             None => outcome.gone.push(path.clone()),
@@ -104,9 +116,12 @@ pub fn spawn(
     proxy: EventLoopProxy<ViewerEvent>,
 ) {
     std::thread::spawn(move || {
-        let result = run(&argv, &key, &paths).map_err(|err| format!("{err:#}"));
+        let outcome = run(&argv, &key, &paths).unwrap_or_else(|err| HandlerOutcome {
+            err: Some(err),
+            ..HandlerOutcome::default()
+        });
         // Only fails if the event loop has gone away, in which case we are exiting
-        let _ = proxy.send_event(ViewerEvent::HandlerDone(result));
+        let _ = proxy.send_event(ViewerEvent::HandlerDone(outcome));
     });
 }
 

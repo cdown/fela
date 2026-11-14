@@ -119,15 +119,15 @@ fn set_fullscreen(window: &Window, is_fullscreen: bool) {
 enum ViewerEvent {
     Listed(Vec<PathBuf>),
     Loaded(loader::LoadResult),
-    HandlerDone(Result<key_handler::HandlerChanges, String>),
+    HandlerDone(key_handler::HandlerOutcome),
 }
 
-#[derive(Clone, Copy, PartialEq)]
 enum HandlerState {
     Idle,
     /// The prefix key was pressed, and the next key goes to the handler.
     Armed,
     Running,
+    Failed(anyhow::Error),
 }
 
 struct Viewer {
@@ -188,7 +188,7 @@ impl Viewer {
     }
 
     fn bar_height(&self) -> usize {
-        if self.is_bar_shown {
+        if self.is_bar_shown || matches!(self.handler_state, HandlerState::Failed(_)) {
             bar::HEIGHT
         } else {
             0
@@ -246,10 +246,11 @@ impl Viewer {
 
     fn status(&self, detail: Option<f64>) -> (String, String) {
         let cur = self.files.index();
-        let left = match (&self.notice, self.handler_state) {
+        let left = match (&self.notice, &self.handler_state) {
             (Some(notice), _) => notice.clone(),
             (None, HandlerState::Armed) => "key handler: press a key, or Escape to abort".into(),
             (None, HandlerState::Running) => "key handler: running".into(),
+            (None, HandlerState::Failed(err)) => format!("key handler: {err:#}"),
             (None, HandlerState::Idle) => self
                 .files
                 .current()
@@ -258,12 +259,15 @@ impl Viewer {
         let mark = if self.files.is_marked(cur) { "* " } else { "" };
         let state = if self.files.is_listing {
             "listing "
-        } else if self.cache.get(cur).is_none_or(|entry| {
-            entry.result.as_ref().is_ok_and(|ready| {
-                ready.is_draft
-                    || (matches!(self.view.scale, ScaleMode::Zoom(_)) && ready.original.is_none())
+        } else if self.files.current().is_some()
+            && self.cache.get(cur).is_none_or(|entry| {
+                entry.result.as_ref().is_ok_and(|ready| {
+                    ready.is_draft
+                        || (matches!(self.view.scale, ScaleMode::Zoom(_))
+                            && ready.original.is_none())
+                })
             })
-        }) {
+        {
             "loading "
         } else {
             ""
@@ -283,23 +287,20 @@ impl Viewer {
         )
     }
 
-    fn reset_view(&mut self) {
-        self.view.pan = (0.0, 0.0);
-        self.view.turns = 0;
-        self.refresh();
-    }
-
-    fn remove_files(&mut self, el: &ActiveEventLoop, paths: &[PathBuf]) {
+    fn remove_files(&mut self, paths: &[PathBuf]) -> bool {
         if paths.is_empty() {
-            return;
+            return false;
         }
         self.files.remove(paths);
         self.cache.reindex(|path| self.files.position(0, path));
         self.trail.clear();
-        if self.files.len() == 0 {
-            el.exit();
+        self.view.pan = (0.0, 0.0);
+        self.view.turns = 0;
+        let is_empty = self.files.len() == 0;
+        if is_empty {
+            self.shown_frame = None;
         }
-        self.reset_view();
+        is_empty
     }
 
     fn on_handler_key(&mut self, key: &Key) {
@@ -320,30 +321,30 @@ impl Viewer {
         self.request_redraw();
     }
 
-    fn on_handler_done(
-        &mut self,
-        el: &ActiveEventLoop,
-        result: Result<key_handler::HandlerChanges, String>,
-    ) {
+    fn on_handler_done(&mut self, el: &ActiveEventLoop, outcome: key_handler::HandlerOutcome) {
         self.handler_state = HandlerState::Idle;
-        match result {
-            Ok(outcome) => {
-                for path in &outcome.changed {
-                    if let Some(idx) = self.files.position(self.files.index(), path) {
-                        self.cache.remove(idx);
-                    }
-                }
-                self.remove_files(el, &outcome.gone);
+        for path in &outcome.changed {
+            if let Some(idx) = self.files.position(self.files.index(), path) {
+                self.cache.remove(idx);
             }
-            Err(err) => self.notice = Some(format!("key handler: {err}")),
+        }
+        let is_empty = self.remove_files(&outcome.gone);
+        if let Some(err) = outcome.err {
+            self.handler_state = HandlerState::Failed(err);
+        } else if is_empty {
+            el.exit();
         }
         self.refresh();
     }
 
     fn refresh(&mut self) {
         self.schedule();
-        if let (Some(window), Some(path)) = (&self.window, self.files.current()) {
-            window.set_title(&format!("fela - {}", path.display()));
+        if let Some(window) = &self.window {
+            if let Some(path) = self.files.current() {
+                window.set_title(&format!("fela - {}", path.display()));
+            } else {
+                window.set_title("fela");
+            }
         }
         self.request_redraw();
     }
@@ -512,6 +513,10 @@ impl Viewer {
             HandlerState::Idle => {}
             HandlerState::Armed => return self.on_handler_key(key),
             HandlerState::Running => return,
+            HandlerState::Failed(_) => {
+                self.handler_state = HandlerState::Idle;
+                self.refresh();
+            }
         }
         if self.mods.control_key() {
             match key.as_ref() {
@@ -555,8 +560,13 @@ impl Viewer {
                 return self.request_redraw();
             }
             Key::Character("D") => {
-                let current: Vec<_> = self.files.current().cloned().into_iter().collect();
-                return self.remove_files(el, &current);
+                let Some(path) = self.files.current().cloned() else {
+                    return;
+                };
+                if self.remove_files(&[path]) {
+                    el.exit();
+                }
+                return self.refresh();
             }
             Key::Character("r") => {
                 self.cache.remove(from);
@@ -689,7 +699,7 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
                 self.refresh();
             }
             ViewerEvent::Loaded(loaded) => self.on_loaded(loaded),
-            ViewerEvent::HandlerDone(result) => self.on_handler_done(el, result),
+            ViewerEvent::HandlerDone(outcome) => self.on_handler_done(el, outcome),
         }
     }
 
