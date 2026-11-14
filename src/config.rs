@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::io::ErrorKind;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 
 #[derive(Deserialize, Debug)]
@@ -9,6 +9,8 @@ use std::path::PathBuf;
 pub struct Config {
     /// How many images [ and ] move by.
     pub jump: usize,
+    /// Milliseconds between steps while holding a next or previous image key.
+    pub navigation_repeat_ms: NonZeroU32,
     /// How many bytes to allot in the direction of travel per byte in the opposite direction.
     pub prefetch_bias: NonZeroUsize,
     /// Whether to also prepare the image we would reach by repeating a jump.
@@ -27,6 +29,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             jump: 5,
+            navigation_repeat_ms: NonZeroU32::new(50).expect("BUG: zero repeat interval"),
             prefetch_bias: NonZeroUsize::new(3).expect("BUG: zero default bias"),
             prefetch_jump: true,
             prefetch_inflight: 4,
@@ -66,6 +69,14 @@ pub fn load() -> Result<Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_navigation_repeat_interval() {
+        assert_eq!(Config::default().navigation_repeat_ms.get(), 50);
+        let config: Config = toml::from_str("navigation_repeat_ms = 120").unwrap();
+        assert_eq!(config.navigation_repeat_ms.get(), 120);
+        assert!(toml::from_str::<Config>("navigation_repeat_ms = 0").is_err());
+    }
 
     #[test]
     fn test_prefetch_bias_must_be_positive() {

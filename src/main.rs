@@ -12,9 +12,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::WindowEvent;
+use winit::event::{KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey, PhysicalKey};
 use winit::monitor::MonitorHandle;
 use winit::window::{Window, WindowAttributes, WindowId};
 
@@ -122,6 +122,30 @@ enum IdleZoom {
     Ready,
 }
 
+struct HeldNavigation {
+    key: PhysicalKey,
+    step: isize,
+    next: Instant,
+}
+
+impl HeldNavigation {
+    fn take_step(&mut self, now: Instant, interval: Duration) -> Option<isize> {
+        if now < self.next {
+            return None;
+        }
+        self.next = now + interval;
+        Some(self.step)
+    }
+}
+
+fn navigation_step(key: &Key) -> Option<isize> {
+    match key.as_ref() {
+        Key::Character("n") | Key::Named(NamedKey::Space) => Some(1),
+        Key::Character("p") | Key::Named(NamedKey::Backspace) => Some(-1),
+        _ => None,
+    }
+}
+
 struct Viewer {
     args: Args,
     cfg: config::Config,
@@ -147,6 +171,7 @@ struct Viewer {
     /// image until this time. See `FOCUS_AFTER_FIRST_IMAGE`.
     focus_by: Option<Instant>,
     idle_zoom: IdleZoom,
+    held_navigation: Option<HeldNavigation>,
     is_fullscreen: bool,
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
@@ -592,6 +617,53 @@ impl Viewer {
         Ok(())
     }
 
+    fn navigation_interval(&self) -> Duration {
+        Duration::from_millis(u64::from(self.cfg.navigation_repeat_ms.get()))
+    }
+
+    fn on_keyboard(&mut self, el: &ActiveEventLoop, event: KeyEvent, is_synthetic: bool) {
+        let is_held = self
+            .held_navigation
+            .as_ref()
+            .is_some_and(|held| held.key == event.physical_key);
+        if !event.state.is_pressed() {
+            if is_held {
+                self.held_navigation = None;
+            }
+            return;
+        }
+        let step = navigation_step(&event.logical_key);
+        if event.repeat {
+            if !is_held && step.is_none() && event.logical_key.as_ref() != Key::Character("s") {
+                self.on_key(el, &event.logical_key);
+            }
+            return;
+        }
+        if is_synthetic && step.is_some() {
+            return;
+        }
+        self.held_navigation = step
+            .filter(|_| {
+                matches!(
+                    self.handler_state,
+                    HandlerState::Idle | HandlerState::Failed(_)
+                ) && !self.mods.control_key()
+            })
+            .map(|step| HeldNavigation {
+                key: event.physical_key,
+                step,
+                next: Instant::now() + self.navigation_interval(),
+            });
+        self.on_key(el, &event.logical_key);
+    }
+
+    fn step(&mut self, step: isize) -> Navigation {
+        let from = self.files.index();
+        let navigation = self.files.step(step);
+        self.after_navigation(from, navigation);
+        navigation
+    }
+
     fn on_key(&mut self, el: &ActiveEventLoop, key: &Key) {
         self.notice = None;
         match self.handler_state {
@@ -614,6 +686,10 @@ impl Viewer {
 
         let key_prefix = self.key_prefix.take();
         let n = isize::try_from(key_prefix.unwrap_or(1)).unwrap_or(isize::MAX);
+        if let Some(step) = navigation_step(key) {
+            self.step(step * n);
+            return;
+        }
         let jump = isize::try_from(self.cfg.jump).unwrap_or(isize::MAX);
         let from = self.files.index();
 
@@ -623,8 +699,6 @@ impl Viewer {
                 return self.request_redraw();
             }
             Key::Character("q" | "Q") => return el.exit(),
-            Key::Character("n") | Key::Named(NamedKey::Space) => self.files.step(n),
-            Key::Character("p") | Key::Named(NamedKey::Backspace) => self.files.step(-n),
             Key::Character("]") => self.files.step(n.saturating_mul(jump)),
             Key::Character("[") => self.files.step(n.saturating_mul(jump).saturating_neg()),
             Key::Character("g") => self.files.go_to(0),
@@ -707,6 +781,10 @@ impl Viewer {
             }
             _ => return,
         };
+        self.after_navigation(from, navigation);
+    }
+
+    fn after_navigation(&mut self, from: usize, navigation: Navigation) {
         if navigation == Navigation::Moved {
             let to = self.files.index();
             self.last_step = if to > from {
@@ -791,18 +869,36 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
     fn window_event(&mut self, el: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => el.exit(),
-            WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
-                if !event.repeat || event.logical_key.as_ref() != Key::Character("s") {
-                    self.on_key(el, &event.logical_key);
-                }
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic,
+                ..
+            } => {
+                self.on_keyboard(el, event, is_synthetic);
             }
-            WindowEvent::ModifiersChanged(mods) => self.mods = mods.state(),
+            WindowEvent::Focused(false) => self.held_navigation = None,
+            WindowEvent::ModifiersChanged(mods) => {
+                if self.mods != mods.state() {
+                    self.held_navigation = None;
+                }
+                self.mods = mods.state();
+            }
             WindowEvent::Resized(_) | WindowEvent::RedrawRequested => self.request_redraw(),
             _ => {}
         }
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        let interval = self.navigation_interval();
+        if let Some(step) = self
+            .held_navigation
+            .as_mut()
+            .and_then(|held| held.take_step(Instant::now(), interval))
+        {
+            if self.step(step) == Navigation::Unchanged {
+                self.held_navigation = None;
+            }
+        }
         let has_image = self.current_frame().is_some();
         let is_holding = !has_image && self.focus_by.is_some_and(|by| Instant::now() < by);
         if !is_holding && std::mem::take(&mut self.needs_redraw) {
@@ -813,7 +909,11 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
             window.focus_window();
             self.focus_by = None;
         }
-        let mut next_wake = self.focus_by;
+        let mut next_wake = self
+            .focus_by
+            .into_iter()
+            .chain(self.held_navigation.as_ref().map(|held| held.next))
+            .min();
         if let IdleZoom::WaitingUntil(deadline) = self.idle_zoom {
             if Instant::now() >= deadline {
                 self.idle_zoom = IdleZoom::Ready;
@@ -885,6 +985,7 @@ fn main() -> Result<()> {
         needs_redraw: false,
         focus_by: None,
         idle_zoom: IdleZoom::WaitingForFrame,
+        held_navigation: None,
         window: None,
         surface: None,
         err: None,
@@ -902,6 +1003,23 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_held_navigation_does_not_catch_up_after_a_stall() {
+        let now = Instant::now();
+        let interval = Duration::from_millis(50);
+        let mut held = HeldNavigation {
+            key: PhysicalKey::Code(winit::keyboard::KeyCode::KeyP),
+            step: -1,
+            next: now + interval,
+        };
+        assert_eq!(held.take_step(now, interval), None);
+        assert_eq!(held.take_step(now + interval, interval), Some(-1));
+        let after_stall = now + Duration::from_millis(220);
+        assert_eq!(held.take_step(after_stall, interval), Some(-1));
+        assert_eq!(held.take_step(after_stall, interval), None);
+        assert_eq!(held.take_step(after_stall + interval, interval), Some(-1));
+    }
 
     #[test]
     fn test_zoomed_prefetch_matches_navigation() {
