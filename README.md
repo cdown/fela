@@ -47,8 +47,7 @@ fela reads `%APPDATA%\fela\config.toml` on Windows, and
 `$XDG_CONFIG_HOME/fela/config.toml` on Linux. These are the defaults:
 
     jump = 5
-    prefetch_ahead = 4
-    prefetch_behind = 1
+    prefetch_bias = 3
     prefetch_jump = true
     prefetch_inflight = 4
     cache_mb = 512

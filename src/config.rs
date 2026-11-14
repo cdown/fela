@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::io::ErrorKind;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 #[derive(Deserialize, Debug)]
@@ -8,9 +9,8 @@ use std::path::PathBuf;
 pub struct Config {
     /// How many images [ and ] move by.
     pub jump: usize,
-    /// How many images to prepare in the direction of travel, and in the opposite one.
-    pub prefetch_ahead: usize,
-    pub prefetch_behind: usize,
+    /// How many bytes to allot in the direction of travel per byte in the opposite direction.
+    pub prefetch_bias: NonZeroUsize,
     /// Whether to also prepare the image we would reach by repeating a jump.
     pub prefetch_jump: bool,
     /// How many images may be decoded speculatively at once.
@@ -27,8 +27,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             jump: 5,
-            prefetch_ahead: 4,
-            prefetch_behind: 1,
+            prefetch_bias: NonZeroUsize::new(3).expect("BUG: zero default bias"),
             prefetch_jump: true,
             prefetch_inflight: 4,
             cache_mb: 512,
@@ -61,5 +60,18 @@ pub fn load() -> Result<Config> {
         }
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(Config::default()),
         Err(err) => Err(err).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_prefetch_bias_must_be_positive() {
+        let config: Config = toml::from_str("prefetch_bias = 1").unwrap();
+        assert_eq!(config.prefetch_bias.get(), 1);
+        assert!(toml::from_str::<Config>("prefetch_bias = 0").is_err());
+        assert!(toml::from_str::<Config>("prefetch_bais = 1").is_err());
     }
 }

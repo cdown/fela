@@ -25,6 +25,7 @@ mod decode;
 mod files;
 mod key_handler;
 mod loader;
+mod prefetch;
 mod sharpness;
 mod tiff;
 mod view;
@@ -140,12 +141,6 @@ struct Viewer {
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
     err: Option<anyhow::Error>,
-}
-
-#[derive(Default)]
-struct Prefetch {
-    indices: Vec<usize>,
-    probe: Option<usize>,
 }
 
 impl Viewer {
@@ -385,38 +380,38 @@ impl Viewer {
         })
     }
 
-    fn prefetch(&self, current: &Path) -> Prefetch {
+    fn prefetch(&self, current: &Path) -> prefetch::Prefetch {
         let cur = self.files.index();
-        let dir = if self.last_step < 0 { -1 } else { 1 };
-        let nr_ahead = self.cfg.prefetch_ahead.min(self.files.len()) as isize;
-        let nr_behind = self.cfg.prefetch_behind.min(self.files.len()) as isize;
-        let jump =
-            (self.cfg.prefetch_jump && self.last_step.unsigned_abs() > 1).then_some(self.last_step);
-        let mut left = self.cache.prefetch_bytes(current, self.frame_params(cur));
-        let mut seen = std::collections::HashSet::from([current]);
-        let mut prefetch = Prefetch::default();
-        for step in jump
-            .into_iter()
-            .chain((1..=nr_ahead).map(|nr| nr * dir))
-            .chain((1..=nr_behind).map(|nr| -nr * dir))
-        {
-            if left == 0 {
-                break;
-            }
-            if let Some(idx) = cur.checked_add_signed(step) {
-                if let Some(path) = self.files.get(idx).filter(|path| seen.insert(path)) {
-                    let cost = self.cache.frame_cost(path, self.frame_params(idx));
-                    if let Some(left_after) = left.checked_sub(cost) {
-                        left = left_after;
-                        prefetch.indices.push(idx);
-                    } else if self.cache.source_size(path).is_none() {
-                        prefetch.probe = Some(idx);
-                        break;
-                    }
-                }
-            }
-        }
-        prefetch
+        let params = self.view.frame_params(self.area(), false);
+        let jump = cur
+            .checked_add_signed(self.last_step)
+            .filter(|_| self.cfg.prefetch_jump && self.last_step.unsigned_abs() > 1);
+        let candidates = |ahead| {
+            prefetch::indices(
+                cur,
+                self.files.len(),
+                self.last_step,
+                self.cfg.prefetch_jump,
+                ahead,
+            )
+            .filter_map(|idx| {
+                let path = self.files.get(idx)?;
+                Some(prefetch::Candidate {
+                    idx,
+                    path,
+                    bytes: self.cache.frame_cost(path, params),
+                    is_estimate: self.cache.source_size(path).is_none(),
+                    is_jump: Some(idx) == jump,
+                })
+            })
+        };
+        prefetch::select(
+            current,
+            candidates(true),
+            candidates(false),
+            self.cache.prefetch_bytes(current, self.frame_params(cur)),
+            self.cfg.prefetch_bias,
+        )
     }
 
     fn schedule(&mut self, completed: Option<&Path>) {
@@ -429,7 +424,7 @@ impl Viewer {
         let prefetch = self
             .files
             .current()
-            .map_or_else(Prefetch::default, |path| self.prefetch(path));
+            .map_or_else(prefetch::Prefetch::default, |path| self.prefetch(path));
         let view = &self.view;
         let selected: HashMap<_, _> = prefetch
             .indices
@@ -449,7 +444,7 @@ impl Viewer {
         let prefetch = prefetch
             .indices
             .into_iter()
-            .chain(prefetch.probe)
+            .chain(prefetch.probes)
             .filter_map(|idx| self.job_for(idx))
             .collect();
         self.loader.set_jobs(self.job_for(cur), prefetch, completed);
