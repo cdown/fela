@@ -1,184 +1,324 @@
-use crate::decode::{DecodedImage, FitParams, RenderedImage};
-use crate::loader::LoadResult;
+use crate::decode::{DecodedImage, ImageSize};
+use crate::loader::{LoadResult, PreparedImage};
+use crate::view::FrameParams;
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub struct CachedImage {
-    pub fitted: Arc<RenderedImage>,
-    pub original: Option<Arc<DecodedImage>>,
-    pub upright_size: (u32, u32),
-    pub is_draft: bool,
+pub struct CachedFrame {
+    pub params: FrameParams,
+    pub result: Result<PreparedImage, String>,
 }
 
+impl CachedFrame {
+    fn size_bytes(&self) -> usize {
+        self.result
+            .as_ref()
+            .map_or(0, |ready| ready.frame.px.len() * size_of::<u32>())
+    }
+}
+
+#[derive(Default)]
 pub struct ImageCacheEntry {
-    pub path: PathBuf,
-    pub fit_params: FitParams,
-    pub result: Result<CachedImage, String>,
+    fit: Option<CachedFrame>,
+    zoom: Option<CachedFrame>,
+    pub original: Option<Arc<DecodedImage>>,
+    last_used: u64,
 }
 
 impl ImageCacheEntry {
-    pub fn is_draft(&self) -> bool {
-        self.result.as_ref().is_ok_and(|ready| ready.is_draft)
+    fn frame_slot(&self, params: FrameParams) -> &Option<CachedFrame> {
+        if params.is_zoom() {
+            &self.zoom
+        } else {
+            &self.fit
+        }
     }
 
-    fn size_bytes(&self) -> usize {
-        self.result.as_ref().map_or(0, |ready| {
-            ready.fitted.px.len() * 4 + ready.original.as_ref().map_or(0, |img| img.px.len())
-        })
+    pub fn frame(&self, params: FrameParams) -> Option<&CachedFrame> {
+        self.frame_slot(params)
+            .as_ref()
+            .filter(|frame| frame.params == params)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.fit.is_none() && self.zoom.is_none() && self.original.is_none()
     }
 }
 
+#[derive(Default)]
+struct ImageInfo {
+    source_size: Option<ImageSize>,
+    revision: u64,
+}
+
 pub struct ImageCache {
-    entries: HashMap<usize, ImageCacheEntry>, // Keyed by position in the file list
+    entries: HashMap<PathBuf, ImageCacheEntry>,
+    info: HashMap<PathBuf, ImageInfo>,
     budget_bytes: usize,
+    serial: u64,
 }
 
 impl ImageCache {
     pub fn new(budget_mib: usize) -> Self {
         Self {
             entries: HashMap::new(),
+            info: HashMap::new(),
             budget_bytes: budget_mib.saturating_mul(1 << 20),
+            serial: 0,
         }
     }
 
-    pub fn get(&self, idx: usize) -> Option<&ImageCacheEntry> {
-        self.entries.get(&idx)
+    pub fn get(&self, path: &Path) -> Option<&ImageCacheEntry> {
+        self.entries.get(path)
     }
 
-    pub fn remove(&mut self, idx: usize) {
-        self.entries.remove(&idx);
+    pub fn invalidate(&mut self, path: &Path) {
+        self.serial += 1;
+        self.entries.remove(path);
+        self.info.insert(
+            path.to_owned(),
+            ImageInfo {
+                revision: self.serial,
+                ..ImageInfo::default()
+            },
+        );
     }
 
-    pub fn insert(&mut self, idx: usize, loaded: LoadResult) {
-        let result = loaded.result.map(|prepared| CachedImage {
-            fitted: prepared.fitted,
-            original: prepared.original,
-            upright_size: prepared.upright_size,
-            is_draft: prepared.is_draft,
-        });
-        let is_draft = result.as_ref().is_ok_and(|ready| ready.is_draft);
-        let has_real = self
-            .get(idx)
-            .is_some_and(|entry| entry.result.is_ok() && !entry.is_draft());
-        if is_draft && has_real {
-            return;
+    pub fn revision(&self, path: &Path) -> u64 {
+        self.info.get(path).map_or(0, |info| info.revision)
+    }
+
+    pub fn source_size(&self, path: &Path) -> Option<ImageSize> {
+        self.info.get(path)?.source_size
+    }
+
+    pub fn touch(&mut self, path: &Path) {
+        if let Some(entry) = self.entries.get_mut(path) {
+            self.serial += 1;
+            entry.last_used = self.serial;
         }
-        let entry = ImageCacheEntry {
-            path: loaded.job.path,
-            fit_params: loaded.job.fit_params,
-            result,
+    }
+
+    pub fn insert(&mut self, loaded: LoadResult, wanted: FrameParams) -> bool {
+        let job = loaded.job;
+        if self.revision(&job.path) != job.revision {
+            return false;
+        }
+        let entry = self.entries.entry(job.path.clone()).or_default();
+        self.serial += 1;
+        entry.last_used = self.serial;
+        if let Some(original) = loaded.original {
+            self.info.entry(job.path).or_default().source_size = Some(original.upright_size(0));
+            entry.original = Some(original);
+        }
+        let slot = if job.params.is_zoom() {
+            &mut entry.zoom
+        } else {
+            &mut entry.fit
         };
-        self.entries.insert(idx, entry);
+        let is_draft = loaded.result.as_ref().is_ok_and(|ready| ready.is_draft);
+        if slot.as_ref().is_some_and(|frame| {
+            (frame.params == wanted && frame.params != job.params)
+                || (is_draft
+                    && frame.params == job.params
+                    && frame.result.as_ref().is_ok_and(|ready| !ready.is_draft))
+        }) {
+            return false;
+        }
+        *slot = Some(CachedFrame {
+            params: job.params,
+            result: loaded.result,
+        });
+        true
     }
 
-    /// `needs_original` is whether the image at `cur` is being drawn from its decoded original.
-    pub fn trim(&mut self, cur: usize, needs_original: bool) {
-        let used: usize = self.entries.values().map(ImageCacheEntry::size_bytes).sum();
-        let mut over = used.saturating_sub(self.budget_bytes);
-        let mut furthest_first: Vec<_> = self.entries.keys().copied().collect();
-        furthest_first.sort_unstable_by_key(|idx| Reverse(idx.abs_diff(cur)));
-
-        // Decoded originals are ~10x the size of what goes on screen and can be decoded again, so
-        // get rid of those first. Not the one we are drawing from, though. It would be decoded
-        // again right away, only to be dropped here again.
-        let is_in_use = |idx: &&usize| needs_original && **idx == cur;
-        for idx in furthest_first.iter().filter(|idx| !is_in_use(idx)) {
-            if over == 0 {
-                return;
-            }
-            let original = self
-                .entries
-                .get_mut(idx)
-                .and_then(|entry| entry.result.as_mut().ok())
-                .and_then(|ready| ready.original.take());
-            over = over.saturating_sub(original.map_or(0, |img| img.px.len()));
+    pub fn frame_cost(&self, path: &Path, params: FrameParams) -> usize {
+        let frame = self.get(path).and_then(|entry| entry.frame(params));
+        if let Some(frame) = frame.filter(|frame| {
+            frame.result.as_ref().is_err()
+                || frame.result.as_ref().is_ok_and(|ready| !ready.is_draft)
+        }) {
+            return frame.size_bytes();
         }
-        for idx in furthest_first.iter().filter(|idx| **idx != cur) {
-            if over == 0 {
-                return;
-            }
-            let entry = self.entries.remove(idx);
-            over = over.saturating_sub(entry.map_or(0, |entry| entry.size_bytes()));
-        }
+        let estimated = self
+            .info
+            .get(path)
+            .and_then(|info| info.source_size)
+            .map_or_else(
+                || params.area.frame_bytes(),
+                |size| params.size(size).frame_bytes(),
+            );
+        estimated.max(frame.map_or(0, CachedFrame::size_bytes))
     }
 
-    pub fn reindex(&mut self, position: impl Fn(&Path) -> Option<usize>) {
-        self.entries = std::mem::take(&mut self.entries)
-            .into_values()
-            .filter_map(|entry| Some((position(&entry.path)?, entry)))
-            .collect();
+    pub fn prefetch_bytes(&self, current: &Path, params: FrameParams) -> usize {
+        let mut left = self
+            .budget_bytes
+            .saturating_sub(self.frame_cost(current, params));
+        if params.is_zoom() {
+            let original = self.get(current).and_then(|entry| entry.original.as_ref());
+            if let Some(left_after) = original.and_then(|img| left.checked_sub(img.px.len())) {
+                left = left_after;
+            }
+        }
+        left
+    }
+
+    pub fn trim(
+        &mut self,
+        current: Option<(&Path, FrameParams)>,
+        selected: &HashMap<&Path, FrameParams>,
+    ) {
+        let mut left = self.budget_bytes;
+        if let Some((path, params)) = current.filter(|(_, params)| params.is_zoom()) {
+            let frame_bytes = self.frame_cost(path, params);
+            if let Some(entry) = self.entries.get_mut(path) {
+                let mut after_frame = left.saturating_sub(frame_bytes);
+                let before_original = after_frame;
+                keep_original(&mut entry.original, &mut after_frame);
+                left -= before_original - after_frame;
+            }
+        }
+        for (path, params) in current
+            .iter()
+            .copied()
+            .chain(selected.iter().map(|(&path, &params)| (path, params)))
+        {
+            if let Some(frame) = self.get(path).and_then(|entry| entry.frame(params)) {
+                left = left.saturating_sub(frame.size_bytes());
+            }
+        }
+
+        let mut newest_first: Vec<_> = self.entries.iter_mut().collect();
+        newest_first.sort_unstable_by_key(|(_, entry)| Reverse(entry.last_used));
+        for (path, entry) in &mut newest_first {
+            let is_current = current.is_some_and(|(cur, _)| cur == path.as_path());
+            let active = if is_current {
+                current.map(|(_, params)| params)
+            } else {
+                selected.get(path.as_path()).copied()
+            };
+            for slot in [&mut entry.fit, &mut entry.zoom] {
+                let Some(frame) = slot else { continue };
+                if Some(frame.params) == active {
+                    continue;
+                }
+                if let Some(left_after) = left.checked_sub(frame.size_bytes()) {
+                    left = left_after;
+                } else {
+                    *slot = None;
+                }
+            }
+        }
+        for (path, entry) in newest_first {
+            if !current.is_some_and(|(cur, params)| cur == path.as_path() && params.is_zoom()) {
+                keep_original(&mut entry.original, &mut left);
+            }
+        }
+        self.entries.retain(|_, entry| !entry.is_empty());
+    }
+}
+
+fn keep_original(original: &mut Option<Arc<DecodedImage>>, left: &mut usize) {
+    if let Some(img) = original {
+        if let Some(left_after) = left.checked_sub(img.px.len()) {
+            *left = left_after;
+        } else {
+            *original = None;
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::loader::{LoadJob, PreparedImage};
+    use crate::decode::RenderedImage;
+    use crate::loader::LoadJob;
+    use crate::view::{ScaleMode, View};
 
-    const FITTED_LEN: usize = 400 << 10;
-    const ORIGINAL_LEN: usize = 600 << 10;
-
-    /// Three images of 1000KiB each, against a budget of 1MiB.
-    fn full_cache() -> ImageCache {
-        let mut cache = ImageCache::new(1);
-        for idx in 0..3 {
-            let fit_params = FitParams {
-                w: 1,
-                h: 1,
-                upscale: false,
-                turns: 0,
-            };
-            let fitted = RenderedImage {
-                w: 1,
-                h: 1,
-                px: vec![0; FITTED_LEN / 4],
-            };
-            let original = DecodedImage {
-                w: 1,
-                h: 1,
-                px: vec![0; ORIGINAL_LEN],
-                turns: 0,
-            };
-            let prepared = PreparedImage {
-                fitted: Arc::new(fitted),
-                original: Some(Arc::new(original)),
-                upright_size: (1, 1),
-                is_draft: false,
-            };
-            let job = LoadJob {
-                idx,
-                path: PathBuf::from(idx.to_string()),
-                fit_params,
+    fn loaded(path: &Path, params: FrameParams, original_bytes: usize) -> LoadResult {
+        let source = DecodedImage {
+            w: 512,
+            h: 512,
+            px: vec![0; original_bytes],
+            turns: 0,
+        };
+        let size = params.size(source.upright_size(0));
+        let frame = Arc::new(RenderedImage {
+            w: size.w,
+            h: size.h,
+            px: vec![0; size.frame_bytes() / 4],
+        });
+        LoadResult {
+            job: LoadJob {
+                idx: 0,
+                path: path.to_owned(),
+                params,
+                revision: 0,
                 original: None,
-            };
-            let result = Ok(prepared);
-            cache.insert(idx, LoadResult { job, result });
+            },
+            result: Ok(PreparedImage {
+                frame,
+                is_draft: false,
+            }),
+            original: Some(Arc::new(source)),
         }
-        cache
-    }
-
-    fn has_original(cache: &ImageCache, idx: usize) -> Option<bool> {
-        let ready = cache.get(idx)?.result.as_ref().ok()?;
-        Some(ready.original.is_some())
     }
 
     #[test]
-    fn test_trim_drops_originals_before_entries() {
-        let mut cache = full_cache();
-        cache.trim(2, false);
-        assert_eq!(has_original(&cache, 0), None);
-        assert_eq!(has_original(&cache, 1), Some(false));
-        assert_eq!(has_original(&cache, 2), Some(false));
+    fn test_fit_and_zoom_survive_original_eviction() {
+        let mut cache = ImageCache::new(1);
+        let here = Path::new("here");
+        let next = Path::new("next");
+        let mut view = View::new();
+        let area = ImageSize { w: 320, h: 240 };
+        let fit = view.frame_params(area, true);
+        view.scale = ScaleMode::Zoom(1.0);
+        let zoom = view.frame_params(area, false);
+
+        cache.insert(loaded(next, fit, 768 << 10), zoom);
+        cache.insert(loaded(next, zoom, 768 << 10), zoom);
+        cache.trim(Some((here, zoom)), &HashMap::from([(next, zoom)]));
+        let entry = cache.get(next).unwrap();
+        assert!(entry.original.is_none());
+        assert!(entry.frame(zoom).is_some());
+        assert!(entry.frame(fit).is_some());
+
+        cache.trim(Some((next, zoom)), &HashMap::new());
+        assert!(cache.get(next).unwrap().frame(zoom).is_some());
+        assert_eq!(cache.source_size(next), Some(ImageSize { w: 512, h: 512 }));
     }
 
     #[test]
-    fn test_trim_keeps_original_in_use() {
-        let mut cache = full_cache();
-        cache.trim(2, true);
-        assert_eq!(has_original(&cache, 0), None);
-        assert_eq!(has_original(&cache, 1), None);
-        assert_eq!(has_original(&cache, 2), Some(true));
+    fn test_oversized_frame_is_measured_after_eviction() {
+        let mut cache = ImageCache::new(1);
+        let path = Path::new("large");
+        let params = View::new().frame_params(ImageSize { w: 512, h: 512 }, false);
+        cache.insert(loaded(path, params, 768 << 10), params);
+        let bytes = cache.frame_cost(path, params);
+        let here = Path::new("current");
+        cache.insert(loaded(here, params, 768 << 10), params);
+        cache.trim(Some((here, params)), &HashMap::new());
+        assert!(cache.get(path).is_none());
+        assert_eq!(cache.frame_cost(path, params), bytes);
+        assert_eq!(cache.prefetch_bytes(here, params), 0);
+    }
+
+    #[test]
+    fn test_stale_resize_and_reload_results() {
+        let mut cache = ImageCache::new(1);
+        let path = Path::new("image");
+        let view = View::new();
+        let before = view.frame_params(ImageSize { w: 64, h: 64 }, true);
+        let after = view.frame_params(ImageSize { w: 64, h: 32 }, true);
+
+        cache.insert(loaded(path, after, 768 << 10), after);
+        assert!(!cache.insert(loaded(path, before, 768 << 10), after));
+        assert!(cache.get(path).unwrap().frame(after).is_some());
+        cache.invalidate(path);
+        assert!(!cache.insert(loaded(path, after, 768 << 10), after));
+        assert!(cache.get(path).is_none());
     }
 }

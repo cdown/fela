@@ -1,5 +1,6 @@
-use crate::decode::{self, DecodedImage, FitParams, RenderedImage};
+use crate::decode::{self, DecodedImage, RenderedImage};
 use crate::tiff;
+use crate::view::FrameParams;
 use crate::ViewerEvent;
 use anyhow::{ensure, Result};
 use std::fs::File;
@@ -19,7 +20,8 @@ const HEAD_LEN: usize = 256 << 10;
 pub struct LoadJob {
     pub idx: usize,
     pub path: PathBuf,
-    pub fit_params: FitParams,
+    pub params: FrameParams,
+    pub revision: u64,
     /// The decoded image if we still have it, in which case it only needs scaling.
     pub original: Option<Arc<DecodedImage>>,
 }
@@ -29,16 +31,25 @@ struct EncodedImage {
     orientation: Option<u16>,
 }
 
+impl LoadJob {
+    fn output(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            original: None,
+            ..*self
+        }
+    }
+}
+
 pub struct PreparedImage {
-    pub fitted: Arc<RenderedImage>,
-    pub original: Option<Arc<DecodedImage>>,
-    pub upright_size: (u32, u32),
+    pub frame: Arc<RenderedImage>,
     pub is_draft: bool,
 }
 
 pub struct LoadResult {
     pub job: LoadJob,
     pub result: Result<PreparedImage, String>,
+    pub original: Option<Arc<DecodedImage>>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -77,6 +88,13 @@ struct LoadQueue {
 }
 
 impl LoadQueue {
+    fn wanted(&self, job: &LoadJob) -> Option<&LoadJob> {
+        self.current
+            .iter()
+            .chain(&self.prefetch)
+            .find(|wanted| wanted.path == job.path && wanted.revision == job.revision)
+    }
+
     fn in_flight(&self, path: &Path) -> Option<&InFlight> {
         self.in_flight.iter().find(|job| job.path == path)
     }
@@ -209,12 +227,20 @@ impl SharedLoader {
         }
     }
 
-    fn finish(&self, path: &Path) {
+    fn finish(&self, job: &LoadJob) -> Option<LoadJob> {
         let mut state = self.lock();
+        if let Some(wanted) = state
+            .wanted(job)
+            .filter(|wanted| wanted.params != job.params)
+        {
+            return Some(wanted.output());
+        }
+        let path = job.path.as_path();
         state.set_phase(path, Phase::AwaitingAck);
         state.current.take_if(|job| job.path == path);
         state.prefetch.retain(|job| job.path != path);
         self.wake.notify_all();
+        None
     }
 
     fn forget(&self, path: &Path) {
@@ -266,36 +292,36 @@ impl SharedLoader {
         Ok((status == JobStatus::Continue).then_some(data))
     }
 
-    fn send(&self, job: &LoadJob, result: Result<PreparedImage, String>) {
-        let loaded = LoadResult {
-            job: job.clone(),
-            result,
-        };
+    fn send(&self, loaded: LoadResult) {
         // Only fails if the event loop has gone away, in which case we are exiting
         let _ = self.proxy.send_event(ViewerEvent::Loaded(loaded));
     }
 
     /// Decoding the full size JPEG is slow, but the smaller one is usually fast, so draft it
     fn send_draft(&self, job: &LoadJob, data: &[u8], orientation: u16) {
-        let fit_params = job.fit_params;
+        let job = self.output_job(job);
+        if job.params.is_zoom() {
+            return;
+        }
         let Ok(img) = decode::decode(data, Some(orientation)) else {
             return;
         };
-        if let Ok(fitted) = decode::fit(
-            &img,
-            FitParams {
-                upscale: true,
-                ..fit_params
-            },
-        ) {
+        if let Ok(frame) = job.params.render_draft(&img) {
             let prepared = PreparedImage {
-                fitted: Arc::new(fitted),
-                original: None,
-                upright_size: img.upright_size(fit_params.turns),
+                frame: Arc::new(frame),
                 is_draft: true,
             };
-            self.send(job, Ok(prepared));
+            self.send(LoadResult {
+                job,
+                result: Ok(prepared),
+                original: None,
+            });
         }
+    }
+
+    fn output_job(&self, job: &LoadJob) -> LoadJob {
+        let state = self.lock();
+        state.wanted(job).unwrap_or(job).output()
     }
 
     fn read(&self, job: &LoadJob) -> Result<Option<EncodedImage>> {
@@ -322,12 +348,14 @@ impl SharedLoader {
         }
 
         let embedded = tiff::find_embedded(&head)?;
-        if let Some(draft) = embedded.draft {
-            let draft = self.read_span(path, &mut file, &head, draft, true)?;
-            let Some(data) = draft else {
-                return Ok(None);
-            };
-            self.send_draft(job, &data, embedded.orientation);
+        if !self.output_job(job).params.is_zoom() {
+            if let Some(draft) = embedded.draft {
+                let draft = self.read_span(path, &mut file, &head, draft, true)?;
+                let Some(data) = draft else {
+                    return Ok(None);
+                };
+                self.send_draft(job, &data, embedded.orientation);
+            }
         }
         let data = self.read_span(path, &mut file, &head, embedded.full, false)?;
         Ok(data.map(|data| EncodedImage {
@@ -337,43 +365,61 @@ impl SharedLoader {
     }
 
     /// None means the job was abandoned because it is no longer wanted.
-    fn run(&self, job: &LoadJob) -> Result<Option<PreparedImage>> {
-        let original = match &job.original {
-            Some(img) => Arc::clone(img),
-            None => {
-                let source = self.read(job);
-                self.lister_gate
-                    .lock()
-                    .expect("BUG: lister gate poisoned")
-                    .take();
-                let Some(source) = source? else {
-                    return Ok(None);
-                };
-                if self.start_decoding(&job.path) == JobStatus::Cancelled {
-                    return Ok(None);
-                }
-                Arc::new(decode::decode(&source.data, source.orientation)?)
-            }
+    fn load_original(&self, job: &mut LoadJob) -> Result<Option<Arc<DecodedImage>>> {
+        if let Some(original) = job.original.take() {
+            return Ok(Some(original));
+        }
+        let source = self.read(job);
+        self.lister_gate
+            .lock()
+            .expect("BUG: lister gate poisoned")
+            .take();
+        let Some(source) = source? else {
+            return Ok(None);
         };
-        let fit_params = job.fit_params;
-        let fitted = decode::fit(&original, fit_params)?;
-        Ok(Some(PreparedImage {
-            fitted: Arc::new(fitted),
-            upright_size: original.upright_size(fit_params.turns),
-            original: Some(original),
-            is_draft: false,
-        }))
+        if self.start_decoding(&job.path) == JobStatus::Cancelled {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(decode::decode(
+            &source.data,
+            source.orientation,
+        )?)))
     }
 
     fn work(&self, is_reserved: bool) {
         loop {
-            let job = self.next_job(is_reserved);
-            match self.run(&job).map_err(|err| format!("{err:#}")).transpose() {
-                Some(result) => {
-                    self.finish(&job.path);
-                    self.send(&job, result);
+            let mut job = self.next_job(is_reserved);
+            let original = match self.load_original(&mut job) {
+                Ok(Some(original)) => Ok(original),
+                Err(err) => Err(format!("{err:#}")),
+                Ok(None) => {
+                    self.forget(&job.path);
+                    continue;
                 }
-                None => self.forget(&job.path),
+            };
+            let mut job = self.output_job(&job);
+            loop {
+                let result = match &original {
+                    Ok(img) => job
+                        .params
+                        .render(img)
+                        .map(|frame| PreparedImage {
+                            frame: Arc::new(frame),
+                            is_draft: false,
+                        })
+                        .map_err(|err| format!("{err:#}")),
+                    Err(err) => Err(err.clone()),
+                };
+                if let Some(wanted) = self.finish(&job) {
+                    job = wanted;
+                    continue;
+                }
+                self.send(LoadResult {
+                    job,
+                    result,
+                    original: original.ok(),
+                });
+                break;
             }
         }
     }
@@ -402,18 +448,21 @@ impl Loader {
         Self { shared }
     }
 
-    /// The UI thread has seen the final result for `path`.
-    pub fn acknowledge(&self, path: &Path) {
-        self.shared.forget(path);
-    }
-
-    pub fn set_jobs(&self, current: Option<LoadJob>, prefetch: Vec<LoadJob>) {
+    pub fn set_jobs(
+        &self,
+        current: Option<LoadJob>,
+        prefetch: Vec<LoadJob>,
+        completed: Option<&Path>,
+    ) {
         let mut state = self.shared.lock();
         let LoadQueue {
             current: current_slot,
             in_flight,
             ..
         } = &mut *state;
+        if let Some(path) = completed {
+            in_flight.retain(|job| job.path != path);
+        }
         *current_slot = current;
         if let Some(current) = current_slot {
             for job in in_flight.iter_mut().filter(|job| job.path == current.path) {

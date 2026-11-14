@@ -1,4 +1,5 @@
-use crate::decode::{ImageRect, RenderedImage};
+use crate::decode::{self, DecodedImage, FitParams, ImageRect, ImageSize, RenderedImage};
+use anyhow::Result;
 
 const ZOOM_FACTOR: f64 = 1.5;
 const MIN_ZOOM: f64 = 0.125;
@@ -33,6 +34,65 @@ pub struct Viewport {
     pub h: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FrameParams {
+    pub area: ImageSize,
+    pub scale: ScaleMode,
+    pan: (f64, f64),
+    turns: u8,
+}
+
+impl FrameParams {
+    pub fn is_zoom(self) -> bool {
+        matches!(self.scale, ScaleMode::Zoom(_))
+    }
+
+    pub fn upright_size(self, img: ImageSize) -> ImageSize {
+        img.rotated(self.turns)
+    }
+
+    fn fit_params(self) -> FitParams {
+        FitParams {
+            w: self.area.w,
+            h: self.area.h,
+            upscale: self.scale == ScaleMode::Fit,
+            turns: self.turns,
+        }
+    }
+
+    pub fn size(self, img: ImageSize) -> ImageSize {
+        let img = self.upright_size(img);
+        match self.scale {
+            ScaleMode::Zoom(zoom) => {
+                let region = region(zoom, self.pan, img, self.area);
+                ImageSize {
+                    w: region.w,
+                    h: region.h,
+                }
+            }
+            _ => decode::fit_size(img, self.fit_params()),
+        }
+    }
+
+    pub fn render(self, img: &DecodedImage) -> Result<RenderedImage> {
+        let ScaleMode::Zoom(zoom) = self.scale else {
+            return decode::fit(img, self.fit_params());
+        };
+        let region = region(zoom, self.pan, img.upright_size(self.turns), self.area);
+        decode::render(img, self.turns, region.crop, region.w, region.h)
+    }
+
+    pub fn render_draft(self, img: &DecodedImage) -> Result<RenderedImage> {
+        decode::fit(
+            img,
+            FitParams {
+                upscale: true,
+                ..self.fit_params()
+            },
+        )
+    }
+}
+
 impl View {
     pub fn new() -> Self {
         Self {
@@ -56,8 +116,8 @@ impl View {
         &mut self,
         dir: (f64, f64),
         nr_px: Option<usize>,
-        img: (u32, u32),
-        win: (u32, u32),
+        img: ImageSize,
+        win: ImageSize,
     ) {
         let ScaleMode::Zoom(zoom) = self.scale else {
             return;
@@ -70,25 +130,48 @@ impl View {
             let step = nr_px.map_or(f64::from(win) * PAN_FRACTION, |nr| nr as f64) / zoom;
             *pan = (pan.clamp(-max_pan, max_pan) + dir * step).clamp(-max_pan, max_pan);
         };
-        pan_axis(&mut self.pan.0, dir.0, img.0, win.0);
-        pan_axis(&mut self.pan.1, dir.1, img.1, win.1);
+        pan_axis(&mut self.pan.0, dir.0, img.w, win.w);
+        pan_axis(&mut self.pan.1, dir.1, img.h, win.h);
     }
 
-    pub fn region(&self, zoom: f64, img: (u32, u32), win: (u32, u32)) -> Viewport {
-        let axis = |img, win, pan: f64| {
-            let (len, nr_shown, max_pan) = axis_geometry(zoom, img, win);
-            let pan = pan.clamp(-max_pan, max_pan);
-            let start = (f64::from(img) - len) / 2.0 + pan;
-            let start = if zoom == 1.0 { start.round() } else { start };
-            (start, len, nr_shown)
-        };
-        let (x, w, out_w) = axis(img.0, win.0, self.pan.0);
-        let (y, h, out_h) = axis(img.1, win.1, self.pan.1);
-        Viewport {
-            crop: ImageRect { x, y, w, h },
-            w: out_w,
-            h: out_h,
+    pub fn frame_params(&self, area: ImageSize, is_current: bool) -> FrameParams {
+        FrameParams {
+            area,
+            scale: self.scale,
+            pan: if matches!(self.scale, ScaleMode::Zoom(_)) {
+                self.pan
+            } else {
+                (0.0, 0.0)
+            },
+            turns: if is_current { self.turns } else { 0 },
         }
+    }
+
+    #[cfg(test)]
+    fn region(&self, zoom: f64, img: (u32, u32), win: (u32, u32)) -> Viewport {
+        region(
+            zoom,
+            self.pan,
+            ImageSize { w: img.0, h: img.1 },
+            ImageSize { w: win.0, h: win.1 },
+        )
+    }
+}
+
+fn region(zoom: f64, pan: (f64, f64), img: ImageSize, win: ImageSize) -> Viewport {
+    let axis = |img, win, pan: f64| {
+        let (len, nr_shown, max_pan) = axis_geometry(zoom, img, win);
+        let pan = pan.clamp(-max_pan, max_pan);
+        let start = (f64::from(img) - len) / 2.0 + pan;
+        let start = if zoom == 1.0 { start.round() } else { start };
+        (start, len, nr_shown)
+    };
+    let (x, w, out_w) = axis(img.w, win.w, pan.0);
+    let (y, h, out_h) = axis(img.h, win.h, pan.1);
+    Viewport {
+        crop: ImageRect { x, y, w, h },
+        w: out_w,
+        h: out_h,
     }
 }
 
@@ -177,7 +260,12 @@ mod tests {
     fn test_pan_moves_inward_from_clamped_edge() {
         let mut view = view_with_pan((400.0, 400.0));
         view.scale = ScaleMode::Zoom(1.0);
-        view.pan_by((-1.0, 0.0), Some(10), (300, 300), (200, 200));
+        view.pan_by(
+            (-1.0, 0.0),
+            Some(10),
+            ImageSize { w: 300, h: 300 },
+            ImageSize { w: 200, h: 200 },
+        );
         assert_eq!(view.pan, (40.0, 400.0));
         assert_eq!(view.region(1.0, (300, 300), (200, 200)).crop.x, 90.0);
     }

@@ -14,13 +14,38 @@ pub struct DecodedImage {
     pub turns: u8,
 }
 
-impl DecodedImage {
-    pub fn upright_size(&self, turns: u8) -> (u32, u32) {
-        if (self.turns + turns) % 2 == 1 {
-            (self.h, self.w)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageSize {
+    pub w: u32,
+    pub h: u32,
+}
+
+impl ImageSize {
+    pub fn rotated(self, turns: u8) -> Self {
+        if turns.is_multiple_of(2) {
+            self
         } else {
-            (self.w, self.h)
+            Self {
+                w: self.h,
+                h: self.w,
+            }
         }
+    }
+
+    pub fn frame_bytes(self) -> usize {
+        (self.w as usize)
+            .saturating_mul(self.h as usize)
+            .saturating_mul(size_of::<u32>())
+    }
+}
+
+impl DecodedImage {
+    pub fn upright_size(&self, turns: u8) -> ImageSize {
+        ImageSize {
+            w: self.w,
+            h: self.h,
+        }
+        .rotated(self.turns + turns)
     }
 }
 
@@ -124,13 +149,24 @@ fn decode_png(data: &[u8]) -> Result<DecodedImage> {
 }
 
 pub fn fit(img: &DecodedImage, params: FitParams) -> Result<RenderedImage> {
+    let size = img.upright_size(params.turns);
+    let out = fit_size(size, params);
+    let crop = ImageRect {
+        x: 0.0,
+        y: 0.0,
+        w: f64::from(size.w),
+        h: f64::from(size.h),
+    };
+    render(img, params.turns, crop, out.w, out.h)
+}
+
+pub fn fit_size(ImageSize { w, h }: ImageSize, params: FitParams) -> ImageSize {
     let FitParams {
         w: box_w,
         h: box_h,
         upscale,
-        turns,
+        ..
     } = params;
-    let (w, h) = img.upright_size(turns);
     let mut scale = f64::min(
         f64::from(box_w) / f64::from(w),
         f64::from(box_h) / f64::from(h),
@@ -139,13 +175,10 @@ pub fn fit(img: &DecodedImage, params: FitParams) -> Result<RenderedImage> {
         scale = scale.min(1.0);
     }
     let dim = |v: u32| ((f64::from(v) * scale).round() as u32).max(1);
-    let crop = ImageRect {
-        x: 0.0,
-        y: 0.0,
-        w: f64::from(w),
-        h: f64::from(h),
-    };
-    render(img, turns, crop, dim(w), dim(h))
+    ImageSize {
+        w: dim(w),
+        h: dim(h),
+    }
 }
 
 /// Scaling down is limited by how fast memory can be read, so having more threads doesn't really

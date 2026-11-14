@@ -3,8 +3,9 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use softbuffer::Surface;
+use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
@@ -28,28 +29,9 @@ mod sharpness;
 mod tiff;
 mod view;
 
+use decode::ImageSize;
 use files::Navigation;
-use view::{ScaleMode, ZoomStep};
-
-fn render_frame(
-    ready: &cache::CachedImage,
-    view: &view::View,
-    area: (u32, u32),
-) -> Result<Option<Arc<decode::RenderedImage>>> {
-    let ScaleMode::Zoom(zoom) = view.scale else {
-        return Ok(Some(Arc::clone(&ready.fitted)));
-    };
-    let Some(original) = &ready.original else {
-        return Ok(None);
-    };
-    if area.0 == 0 || area.1 == 0 {
-        return Ok(None);
-    }
-    let img = original.upright_size(view.turns);
-    let region = view.region(zoom, img, area);
-    let frame = decode::render(original, view.turns, region.crop, region.w, region.h)?;
-    Ok(Some(Arc::new(frame)))
-}
+use view::{FrameParams, ScaleMode, ZoomStep};
 
 const WINDOW_SIZE: PhysicalSize<u32> = PhysicalSize::new(800, 600);
 
@@ -160,6 +142,12 @@ struct Viewer {
     err: Option<anyhow::Error>,
 }
 
+#[derive(Default)]
+struct Prefetch {
+    indices: Vec<usize>,
+    probe: Option<usize>,
+}
+
 impl Viewer {
     fn init_window(&mut self, el: &ActiveEventLoop, monitor: Option<MonitorHandle>) -> Result<()> {
         let mut attrs = Window::default_attributes()
@@ -195,18 +183,38 @@ impl Viewer {
         }
     }
 
-    fn area(&self) -> (u32, u32) {
+    fn area(&self) -> ImageSize {
         let bar_h = u32::try_from(self.bar_height()).unwrap_or(u32::MAX);
-        (self.size.width, self.size.height.saturating_sub(bar_h))
+        ImageSize {
+            w: self.size.width,
+            h: self.size.height.saturating_sub(bar_h),
+        }
+    }
+
+    fn frame_params(&self, idx: usize) -> FrameParams {
+        self.view
+            .frame_params(self.area(), idx == self.files.index())
+    }
+
+    fn current_frame(&self) -> Option<&cache::CachedFrame> {
+        self.cache
+            .get(self.files.current()?)?
+            .frame(self.frame_params(self.files.index()))
     }
 
     fn zoom(&self) -> Option<f64> {
         if let ScaleMode::Zoom(zoom) = self.view.scale {
             return Some(zoom);
         }
-        let entry = self.cache.get(self.files.index())?;
-        let ready = entry.result.as_ref().ok().filter(|ready| !ready.is_draft)?;
-        Some(f64::from(ready.fitted.w) / f64::from(ready.upright_size.0))
+        let ready = self
+            .current_frame()?
+            .result
+            .as_ref()
+            .ok()
+            .filter(|ready| !ready.is_draft)?;
+        let size = self.cache.source_size(self.files.current()?)?;
+        let size = self.frame_params(self.files.index()).upright_size(size);
+        Some(f64::from(ready.frame.w) / f64::from(size.w))
     }
 
     fn step_zoom(&mut self, step: ZoomStep) {
@@ -222,19 +230,18 @@ impl Viewer {
     }
 
     fn pan(&mut self, dir: (f64, f64), nr_px: Option<usize>) {
-        let Some(original) = self
-            .cache
-            .get(self.files.index())
-            .and_then(|entry| entry.result.as_ref().ok())
-            .and_then(|ready| ready.original.as_ref())
+        let Some(img) = self
+            .files
+            .current()
+            .and_then(|path| self.cache.source_size(path))
         else {
             return;
         };
         let area = self.area();
-        if area.0 > 0 && area.1 > 0 {
-            let img = original.upright_size(self.view.turns);
-            self.view.pan_by(dir, nr_px, img, area);
-            self.request_redraw();
+        if matches!(self.view.scale, ScaleMode::Zoom(_)) && area.w > 0 && area.h > 0 {
+            self.view
+                .pan_by(dir, nr_px, img.rotated(self.view.turns), area);
+            self.refresh();
         }
     }
 
@@ -260,13 +267,9 @@ impl Viewer {
         let state = if self.files.is_listing {
             "listing "
         } else if self.files.current().is_some()
-            && self.cache.get(cur).is_none_or(|entry| {
-                entry.result.as_ref().is_ok_and(|ready| {
-                    ready.is_draft
-                        || (matches!(self.view.scale, ScaleMode::Zoom(_))
-                            && ready.original.is_none())
-                })
-            })
+            && self
+                .current_frame()
+                .is_none_or(|frame| frame.result.as_ref().is_ok_and(|ready| ready.is_draft))
         {
             "loading "
         } else {
@@ -291,8 +294,10 @@ impl Viewer {
         if paths.is_empty() {
             return false;
         }
+        for path in paths {
+            self.cache.invalidate(path);
+        }
         self.files.remove(paths);
-        self.cache.reindex(|path| self.files.position(0, path));
         self.trail.clear();
         self.view.pan = (0.0, 0.0);
         self.view.turns = 0;
@@ -324,8 +329,8 @@ impl Viewer {
     fn on_handler_done(&mut self, el: &ActiveEventLoop, outcome: key_handler::HandlerOutcome) {
         self.handler_state = HandlerState::Idle;
         for path in &outcome.changed {
-            if let Some(idx) = self.files.position(self.files.index(), path) {
-                self.cache.remove(idx);
+            if self.files.position(self.files.index(), path).is_some() {
+                self.cache.invalidate(path);
             }
         }
         let is_empty = self.remove_files(&outcome.gone);
@@ -338,7 +343,10 @@ impl Viewer {
     }
 
     fn refresh(&mut self) {
-        self.schedule();
+        if let Some(path) = self.files.current() {
+            self.cache.touch(path);
+        }
+        self.schedule(None);
         if let Some(window) = &self.window {
             if let Some(path) = self.files.current() {
                 window.set_title(&format!("fela - {}", path.display()));
@@ -357,60 +365,94 @@ impl Viewer {
     }
 
     fn job_for(&self, idx: usize) -> Option<loader::LoadJob> {
-        let is_current = idx == self.files.index();
-        let (w, h) = self.area();
-        let fit_params = decode::FitParams {
-            w,
-            h,
-            upscale: self.view.scale == ScaleMode::Fit,
-            turns: if is_current { self.view.turns } else { 0 },
-        };
-        let needs_original = is_current && matches!(self.view.scale, ScaleMode::Zoom(_));
-
-        let original = match self.cache.get(idx) {
-            None => None,
-            Some(entry) => match &entry.result {
-                Err(_) => return None,
-                Ok(ready) => {
-                    let is_fitted = entry.fit_params == fit_params && !ready.is_draft;
-                    if is_fitted && (ready.original.is_some() || !needs_original) {
-                        return None;
-                    }
-                    ready.original.clone()
-                }
-            },
-        };
+        let path = self.files.get(idx)?;
+        let params = self.frame_params(idx);
+        let entry = self.cache.get(path);
+        if params.area.w == 0
+            || params.area.h == 0
+            || entry
+                .and_then(|entry| entry.frame(params))
+                .is_some_and(|frame| frame.result.as_ref().map_or(true, |ready| !ready.is_draft))
+        {
+            return None;
+        }
         Some(loader::LoadJob {
             idx,
-            path: self.files.get(idx)?.clone(),
-            fit_params,
-            original,
+            path: path.clone(),
+            params,
+            revision: self.cache.revision(path),
+            original: entry.and_then(|entry| entry.original.clone()),
         })
     }
 
-    fn schedule(&mut self) {
+    fn prefetch(&self, current: &Path) -> Prefetch {
         let cur = self.files.index();
         let dir = if self.last_step < 0 { -1 } else { 1 };
-        let nr_ahead = isize::try_from(self.cfg.prefetch_ahead).unwrap_or(isize::MAX);
-        let nr_behind = isize::try_from(self.cfg.prefetch_behind).unwrap_or(isize::MAX);
-
-        let mut steps = Vec::new();
-        if self.cfg.prefetch_jump && self.last_step.abs() > 1 {
-            steps.push(self.last_step);
-        }
-        steps.extend((1..=nr_ahead).map(|nr| nr * dir));
-        steps.extend((1..=nr_behind).map(|nr| -nr * dir));
-
-        let mut prefetch: Vec<loader::LoadJob> = Vec::new();
-        for step in steps {
-            let Some(idx) = cur.checked_add_signed(step) else {
-                continue;
-            };
-            if prefetch.iter().all(|job| job.idx != idx) {
-                prefetch.extend(self.job_for(idx));
+        let nr_ahead = self.cfg.prefetch_ahead.min(self.files.len()) as isize;
+        let nr_behind = self.cfg.prefetch_behind.min(self.files.len()) as isize;
+        let jump =
+            (self.cfg.prefetch_jump && self.last_step.unsigned_abs() > 1).then_some(self.last_step);
+        let mut left = self.cache.prefetch_bytes(current, self.frame_params(cur));
+        let mut seen = std::collections::HashSet::from([current]);
+        let mut prefetch = Prefetch::default();
+        for step in jump
+            .into_iter()
+            .chain((1..=nr_ahead).map(|nr| nr * dir))
+            .chain((1..=nr_behind).map(|nr| -nr * dir))
+        {
+            if left == 0 {
+                break;
+            }
+            if let Some(idx) = cur.checked_add_signed(step) {
+                if let Some(path) = self.files.get(idx).filter(|path| seen.insert(path)) {
+                    let cost = self.cache.frame_cost(path, self.frame_params(idx));
+                    if let Some(left_after) = left.checked_sub(cost) {
+                        left = left_after;
+                        prefetch.indices.push(idx);
+                    } else if self.cache.source_size(path).is_none() {
+                        prefetch.probe = Some(idx);
+                        break;
+                    }
+                }
             }
         }
-        self.loader.set_jobs(self.job_for(cur), prefetch);
+        prefetch
+    }
+
+    fn schedule(&mut self, completed: Option<&Path>) {
+        let area = self.area();
+        if area.w == 0 || area.h == 0 {
+            self.loader.set_jobs(None, Vec::new(), completed);
+            return;
+        }
+        let cur = self.files.index();
+        let prefetch = self
+            .files
+            .current()
+            .map_or_else(Prefetch::default, |path| self.prefetch(path));
+        let view = &self.view;
+        let selected: HashMap<_, _> = prefetch
+            .indices
+            .iter()
+            .filter_map(|&idx| {
+                Some((
+                    self.files.get(idx)?.as_path(),
+                    view.frame_params(area, false),
+                ))
+            })
+            .collect();
+        let current = self
+            .files
+            .current()
+            .map(|path| (path.as_path(), self.frame_params(cur)));
+        self.cache.trim(current, &selected);
+        let prefetch = prefetch
+            .indices
+            .into_iter()
+            .chain(prefetch.probe)
+            .filter_map(|idx| self.job_for(idx))
+            .collect();
+        self.loader.set_jobs(self.job_for(cur), prefetch, completed);
     }
 
     fn redraw(&mut self) -> Result<()> {
@@ -423,30 +465,31 @@ impl Viewer {
         };
         if size != self.size {
             self.size = size;
-            self.schedule();
+            self.schedule(None);
         }
 
-        let cur = self.files.index();
         let mut message = None;
-        match self.cache.get(cur).map(|entry| &entry.result) {
+        match self.current_frame().map(|frame| &frame.result) {
             Some(Ok(ready)) => {
-                if let Some(frame) = render_frame(ready, &self.view, self.area())? {
-                    self.shown_frame = Some(frame);
-                    self.trail.clear();
-                }
+                self.shown_frame = Some(Arc::clone(&ready.frame));
+                self.trail.clear();
             }
             Some(Err(err)) => {
+                message = Some(err.clone());
                 self.shown_frame = None;
                 self.trail.clear();
-                message = Some(err.clone());
             }
             None if !matches!(self.view.scale, ScaleMode::Zoom(_)) => {
-                let is_ready = |idx: &usize| self.cache.get(*idx).is_some_and(|e| e.result.is_ok());
-                if let Some(nr) = self.trail.iter().rposition(is_ready) {
-                    let idx = self.trail[nr];
-                    if let Some(Ok(ready)) = self.cache.get(idx).map(|entry| &entry.result) {
-                        self.shown_frame = Some(Arc::clone(&ready.fitted));
-                    }
+                if let Some((nr, frame)) =
+                    self.trail.iter().enumerate().rev().find_map(|(nr, &idx)| {
+                        let frame = self
+                            .cache
+                            .get(self.files.get(idx)?)?
+                            .frame(self.frame_params(idx))?;
+                        Some((nr, Arc::clone(&frame.result.as_ref().ok()?.frame)))
+                    })
+                {
+                    self.shown_frame = Some(frame);
                     self.trail.drain(..=nr);
                 }
             }
@@ -569,7 +612,9 @@ impl Viewer {
                 return self.refresh();
             }
             Key::Character("r") => {
-                self.cache.remove(from);
+                if let Some(path) = self.files.current() {
+                    self.cache.invalidate(path);
+                }
                 return self.refresh();
             }
             Key::Character("s") => {
@@ -639,22 +684,19 @@ impl Viewer {
     }
 
     fn on_loaded(&mut self, loaded: loader::LoadResult) {
-        if loaded
+        let completed = loaded
             .result
             .as_ref()
-            .map_or(true, |prepared| !prepared.is_draft)
-        {
-            self.loader.acknowledge(&loaded.job.path);
+            .map_or(true, |ready| !ready.is_draft)
+            .then(|| loaded.job.path.clone());
+        let idx = self.files.position(loaded.job.idx, &loaded.job.path);
+        let mut changed = false;
+        if let Some(idx) = idx {
+            let destination = self.frame_params(idx);
+            changed = self.cache.insert(loaded, destination);
         }
-        let Some(idx) = self.files.position(loaded.job.idx, &loaded.job.path) else {
-            return;
-        };
-        let cur = self.files.index();
-        self.cache.insert(idx, loaded);
-        let needs_original = matches!(self.view.scale, ScaleMode::Zoom(_));
-        self.cache.trim(cur, needs_original);
-        self.schedule();
-        if idx == cur || self.cache.get(cur).is_none() {
+        self.schedule(completed.as_deref());
+        if changed && (idx == Some(self.files.index()) || self.current_frame().is_none()) {
             self.request_redraw();
         }
     }
@@ -680,7 +722,7 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
             Some(monitor) if self.is_fullscreen => monitor.size(),
             _ => WINDOW_SIZE,
         };
-        self.schedule();
+        self.schedule(None);
 
         let res = self.init_window(el, monitor);
         self.exit_on_err(el, res);
@@ -694,7 +736,6 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
             }
             ViewerEvent::Listed(list) => {
                 self.files.set_list(list);
-                self.cache.reindex(|path| self.files.position(0, path));
                 self.trail.clear();
                 self.refresh();
             }
@@ -718,7 +759,7 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        let has_image = self.cache.get(self.files.index()).is_some();
+        let has_image = self.current_frame().is_some();
         let is_holding = !has_image && self.focus_by.is_some_and(|by| Instant::now() < by);
         if !is_holding && std::mem::take(&mut self.needs_redraw) {
             let res = self.redraw();
@@ -809,37 +850,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_zoom_waits_for_original() {
-        let fitted = Arc::new(decode::RenderedImage {
-            w: 1,
-            h: 1,
-            px: vec![0],
-        });
-        let mut ready = cache::CachedImage {
-            fitted: Arc::clone(&fitted),
-            original: None,
-            upright_size: (4, 4),
-            is_draft: true,
-        };
+    fn test_zoomed_prefetch_matches_navigation() {
         let mut view = view::View::new();
-        let area = (2, 2);
-        assert!(Arc::ptr_eq(
-            &render_frame(&ready, &view, area).unwrap().unwrap(),
-            &fitted,
-        ));
-
         view.scale = ScaleMode::Zoom(1.0);
-        assert!(render_frame(&ready, &view, area).unwrap().is_none());
-        ready.is_draft = false;
-        assert!(render_frame(&ready, &view, area).unwrap().is_none());
-
-        ready.original = Some(Arc::new(decode::DecodedImage {
-            w: 4,
-            h: 4,
-            px: vec![0; 4 * 4 * 3],
-            turns: 0,
-        }));
-        let frame = render_frame(&ready, &view, area).unwrap().unwrap();
-        assert_eq!((frame.w, frame.h), area);
+        view.pan = (2.0, 3.0);
+        view.turns = 1;
+        let area = ImageSize { w: 8, h: 6 };
+        let prefetched = view.frame_params(area, false);
+        assert_ne!(prefetched, view.frame_params(area, true));
+        view.turns = 0;
+        assert_eq!(prefetched, view.frame_params(area, true));
+        view.scale = ScaleMode::ShrinkToFit;
+        assert_ne!(prefetched, view.frame_params(area, true));
     }
 }
