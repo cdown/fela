@@ -194,15 +194,11 @@ impl ImageCache {
         let mut newest_first: Vec<_> = self.entries.iter_mut().collect();
         newest_first.sort_unstable_by_key(|(_, entry)| Reverse(entry.last_used));
         for (path, entry) in &mut newest_first {
-            let is_current = current.is_some_and(|(cur, _)| cur == path.as_path());
-            let active = if is_current {
-                current.map(|(_, params)| params)
-            } else {
-                selected.get(path.as_path()).copied()
-            };
             for slot in [&mut entry.fit, &mut entry.zoom] {
                 let Some(frame) = slot else { continue };
-                if Some(frame.params) == active {
+                if current == Some((path.as_path(), frame.params))
+                    || selected.get(path.as_path()) == Some(&frame.params)
+                {
                     continue;
                 }
                 if let Some(left_after) = left.checked_sub(frame.size_bytes()) {
@@ -289,6 +285,27 @@ mod tests {
         cache.trim(Some((next, zoom)), &HashMap::new());
         assert!(cache.get(next).unwrap().frame(zoom).is_some());
         assert_eq!(cache.source_size(next), Some(ImageSize { w: 512, h: 512 }));
+    }
+
+    #[test]
+    fn test_trim_keeps_idle_zoom_and_current_fit() {
+        let mut cache = ImageCache::new(1);
+        let here = Path::new("here");
+        let neighbour = Path::new("neighbour");
+        let view = View::new();
+        let area = ImageSize { w: 400, h: 300 };
+        let fit = view.frame_params(area, true);
+        let zoom = view.frame_params_at_scale(area, true, ScaleMode::Zoom(1.0));
+
+        cache.insert(loaded(here, fit, 768 << 10), fit);
+        cache.insert(loaded(here, zoom, 768 << 10), fit);
+        cache.insert(loaded(neighbour, fit, 768 << 10), fit);
+        cache.trim(Some((here, fit)), &HashMap::from([(here, zoom)]));
+        let entry = cache.get(here).unwrap();
+        assert!(entry.frame(fit).is_some());
+        assert!(entry.frame(zoom).is_some());
+        assert!(entry.original.is_none());
+        assert!(cache.get(neighbour).is_none());
     }
 
     #[test]

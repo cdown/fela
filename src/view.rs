@@ -135,10 +135,19 @@ impl View {
     }
 
     pub fn frame_params(&self, area: ImageSize, is_current: bool) -> FrameParams {
+        self.frame_params_at_scale(area, is_current, self.scale)
+    }
+
+    pub fn frame_params_at_scale(
+        &self,
+        area: ImageSize,
+        is_current: bool,
+        scale: ScaleMode,
+    ) -> FrameParams {
         FrameParams {
             area,
-            scale: self.scale,
-            pan: if matches!(self.scale, ScaleMode::Zoom(_)) {
+            scale,
+            pan: if matches!(scale, ScaleMode::Zoom(_)) {
                 self.pan
             } else {
                 (0.0, 0.0)

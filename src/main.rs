@@ -41,6 +41,9 @@ const WINDOW_SIZE: PhysicalSize<u32> = PhysicalSize::new(800, 600);
 const FOCUS_AFTER_FIRST_IMAGE: bool = cfg!(windows);
 const FOCUS_DEADLINE: Duration = Duration::from_millis(50);
 
+// If this needs tuning, make it configurable later.
+const IDLE_ZOOM_DELAY: Duration = Duration::from_millis(200);
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -113,6 +116,12 @@ enum HandlerState {
     Failed(anyhow::Error),
 }
 
+enum IdleZoom {
+    WaitingForFrame,
+    WaitingUntil(Instant),
+    Ready,
+}
+
 struct Viewer {
     args: Args,
     cfg: config::Config,
@@ -137,6 +146,7 @@ struct Viewer {
     /// Set while we still have to draw the first frame and take focus, which waits for the first
     /// image until this time. See `FOCUS_AFTER_FIRST_IMAGE`.
     focus_by: Option<Instant>,
+    idle_zoom: IdleZoom,
     is_fullscreen: bool,
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
@@ -157,9 +167,7 @@ impl Viewer {
         self.surface = Some(Surface::new(&ctx, window.clone()).map_err(|err| anyhow!("{err}"))?);
         self.window = Some(window);
         if FOCUS_AFTER_FIRST_IMAGE {
-            let deadline = Instant::now() + FOCUS_DEADLINE;
-            self.focus_by = Some(deadline);
-            el.set_control_flow(ControlFlow::WaitUntil(deadline));
+            self.focus_by = Some(Instant::now() + FOCUS_DEADLINE);
         }
         Ok(())
     }
@@ -338,6 +346,7 @@ impl Viewer {
     }
 
     fn refresh(&mut self) {
+        self.idle_zoom = IdleZoom::WaitingForFrame;
         if let Some(path) = self.files.current() {
             self.cache.touch(path);
         }
@@ -359,9 +368,8 @@ impl Viewer {
         }
     }
 
-    fn job_for(&self, idx: usize) -> Option<loader::LoadJob> {
+    fn job_for(&self, idx: usize, params: FrameParams) -> Option<loader::LoadJob> {
         let path = self.files.get(idx)?;
-        let params = self.frame_params(idx);
         let entry = self.cache.get(path);
         if params.area.w == 0
             || params.area.h == 0
@@ -380,7 +388,20 @@ impl Viewer {
         })
     }
 
-    fn prefetch(&self, current: &Path) -> prefetch::Prefetch {
+    fn idle_zoom_params(&self, path: &Path, budget: usize) -> Option<FrameParams> {
+        if self.cfg.prefetch_inflight == 0
+            || matches!(self.view.scale, ScaleMode::Zoom(_))
+            || budget == 0
+        {
+            return None;
+        }
+        let params = self
+            .view
+            .frame_params_at_scale(self.area(), true, ScaleMode::Zoom(1.0));
+        (self.cache.frame_cost(path, params) <= budget).then_some(params)
+    }
+
+    fn prefetch(&self, current: &Path, budget: usize) -> prefetch::Prefetch {
         let cur = self.files.index();
         let params = self.view.frame_params(self.area(), false);
         let jump = cur
@@ -409,7 +430,7 @@ impl Viewer {
             current,
             candidates(true),
             candidates(false),
-            self.cache.prefetch_bytes(current, self.frame_params(cur)),
+            budget,
             self.cfg.prefetch_bias,
         )
     }
@@ -421,10 +442,19 @@ impl Viewer {
             return;
         }
         let cur = self.files.index();
-        let prefetch = self
-            .files
-            .current()
-            .map_or_else(prefetch::Prefetch::default, |path| self.prefetch(path));
+        let params = self.frame_params(cur);
+        let current = self.files.current().map(PathBuf::as_path);
+        let mut budget = current.map_or(0, |path| self.cache.prefetch_bytes(path, params));
+        let idle_params = current
+            .filter(|_| matches!(self.idle_zoom, IdleZoom::Ready))
+            .and_then(|path| self.idle_zoom_params(path, budget));
+        if let (Some(path), Some(idle)) = (current, idle_params) {
+            budget -= self.cache.frame_cost(path, idle);
+        }
+        let idle_job = idle_params.and_then(|params| self.job_for(cur, params));
+        let prefetch = current.map_or_else(prefetch::Prefetch::default, |path| {
+            self.prefetch(path, budget)
+        });
         let view = &self.view;
         let selected: HashMap<_, _> = prefetch
             .indices
@@ -435,19 +465,22 @@ impl Viewer {
                     view.frame_params(area, false),
                 ))
             })
+            .chain(current.zip(idle_params))
             .collect();
-        let current = self
-            .files
-            .current()
-            .map(|path| (path.as_path(), self.frame_params(cur)));
-        self.cache.trim(current, &selected);
-        let prefetch = prefetch
-            .indices
+        self.cache
+            .trim(current.map(|path| (path, params)), &selected);
+        let prefetch = idle_job
             .into_iter()
-            .chain(prefetch.probes)
-            .filter_map(|idx| self.job_for(idx))
+            .chain(
+                prefetch
+                    .indices
+                    .into_iter()
+                    .chain(prefetch.probes)
+                    .filter_map(|idx| self.job_for(idx, self.frame_params(idx))),
+            )
             .collect();
-        self.loader.set_jobs(self.job_for(cur), prefetch, completed);
+        self.loader
+            .set_jobs(self.job_for(cur, params), prefetch, completed);
     }
 
     fn redraw(&mut self) -> Result<()> {
@@ -460,6 +493,7 @@ impl Viewer {
         };
         if size != self.size {
             self.size = size;
+            self.idle_zoom = IdleZoom::WaitingForFrame;
             self.schedule(None);
         }
 
@@ -521,6 +555,19 @@ impl Viewer {
         }
         buf.present().map_err(|err| anyhow!("{err}"))?;
 
+        if matches!(self.idle_zoom, IdleZoom::WaitingForFrame)
+            && self
+                .current_frame()
+                .is_some_and(|frame| frame.result.as_ref().is_ok_and(|ready| !ready.is_draft))
+            && self.files.current().is_some_and(|path| {
+                let budget = self
+                    .cache
+                    .prefetch_bytes(path, self.frame_params(self.files.index()));
+                self.idle_zoom_params(path, budget).is_some()
+            })
+        {
+            self.idle_zoom = IdleZoom::WaitingUntil(Instant::now() + IDLE_ZOOM_DELAY);
+        }
         Ok(())
     }
 
@@ -686,12 +733,14 @@ impl Viewer {
             .then(|| loaded.job.path.clone());
         let idx = self.files.position(loaded.job.idx, &loaded.job.path);
         let mut changed = false;
+        let mut is_current = false;
         if let Some(idx) = idx {
             let destination = self.frame_params(idx);
+            is_current = idx == self.files.index() && loaded.job.params == destination;
             changed = self.cache.insert(loaded, destination);
         }
         self.schedule(completed.as_deref());
-        if changed && (idx == Some(self.files.index()) || self.current_frame().is_none()) {
+        if changed && (is_current || self.current_frame().is_none()) {
             self.request_redraw();
         }
     }
@@ -763,8 +812,17 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
         if let (false, Some(_), Some(window)) = (is_holding, self.focus_by, &self.window) {
             window.focus_window();
             self.focus_by = None;
-            el.set_control_flow(ControlFlow::Wait);
         }
+        let mut next_wake = self.focus_by;
+        if let IdleZoom::WaitingUntil(deadline) = self.idle_zoom {
+            if Instant::now() >= deadline {
+                self.idle_zoom = IdleZoom::Ready;
+                self.schedule(None);
+            } else {
+                next_wake = next_wake.into_iter().chain(Some(deadline)).min();
+            }
+        }
+        el.set_control_flow(next_wake.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }
 }
 
@@ -826,6 +884,7 @@ fn main() -> Result<()> {
         proxy: el.create_proxy(),
         needs_redraw: false,
         focus_by: None,
+        idle_zoom: IdleZoom::WaitingForFrame,
         window: None,
         surface: None,
         err: None,
