@@ -1,1 +1,2 @@
 - Add a Windows icon
+- Report key-handler failures

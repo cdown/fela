@@ -41,9 +41,6 @@ quickly, including on slow disks and network paths.
 Most keys take a vim-style count typed before them. For example, `5n` goes five
 images forward.
 
-`C` copies one filename per line in image list order. Both copy keys include
-the extension and omit the directory.
-
 ## Configuration
 
 fela reads `%APPDATA%\fela\config.toml` on Windows, and
