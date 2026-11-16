@@ -41,6 +41,8 @@ const WINDOW_SIZE: PhysicalSize<u32> = PhysicalSize::new(800, 600);
 const FOCUS_AFTER_FIRST_IMAGE: bool = cfg!(windows);
 const FOCUS_DEADLINE: Duration = Duration::from_millis(50);
 
+const NAVIGATION_REPEAT_DELAY: Duration = Duration::from_millis(500);
+
 // If this needs tuning, make it configurable later.
 const IDLE_ZOOM_DELAY: Duration = Duration::from_millis(200);
 
@@ -129,6 +131,14 @@ struct HeldNavigation {
 }
 
 impl HeldNavigation {
+    fn new(key: PhysicalKey, step: isize, now: Instant) -> Self {
+        Self {
+            key,
+            step,
+            next: now + NAVIGATION_REPEAT_DELAY,
+        }
+    }
+
     fn take_step(&mut self, now: Instant, interval: Duration) -> Option<isize> {
         if now < self.next {
             return None;
@@ -649,11 +659,7 @@ impl Viewer {
                     HandlerState::Idle | HandlerState::Failed(_)
                 ) && !self.mods.control_key()
             })
-            .map(|step| HeldNavigation {
-                key: event.physical_key,
-                step,
-                next: Instant::now() + self.navigation_interval(),
-            });
+            .map(|step| HeldNavigation::new(event.physical_key, step, Instant::now()));
         self.on_key(el, &event.logical_key);
     }
 
@@ -1005,17 +1011,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_held_navigation_does_not_catch_up_after_a_stall() {
+    fn test_held_navigation_repeat_timing() {
         let now = Instant::now();
         let interval = Duration::from_millis(50);
-        let mut held = HeldNavigation {
-            key: PhysicalKey::Code(winit::keyboard::KeyCode::KeyP),
-            step: -1,
-            next: now + interval,
-        };
-        assert_eq!(held.take_step(now, interval), None);
-        assert_eq!(held.take_step(now + interval, interval), Some(-1));
-        let after_stall = now + Duration::from_millis(220);
+        let key = PhysicalKey::Code(winit::keyboard::KeyCode::KeyP);
+        let mut held = HeldNavigation::new(key, -1, now);
+        let first_repeat = now + Duration::from_millis(500);
+        assert_eq!(
+            held.take_step(first_repeat - Duration::from_millis(1), interval),
+            None
+        );
+        assert_eq!(held.take_step(first_repeat, interval), Some(-1));
+        assert_eq!(held.take_step(first_repeat + interval, interval), Some(-1));
+        let after_stall = first_repeat + Duration::from_millis(220);
         assert_eq!(held.take_step(after_stall, interval), Some(-1));
         assert_eq!(held.take_step(after_stall, interval), None);
         assert_eq!(held.take_step(after_stall + interval, interval), Some(-1));
